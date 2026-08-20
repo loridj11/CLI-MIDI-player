@@ -181,6 +181,16 @@ Example file structure:
 
 ---
 
+## Credits & Acknowledgments
+
+This project relies on the following open-source software and components:
+
+* **[FluidSynth](https://www.fluidsynth.org/)**: A real-time SoundFont 2 software synthesizer. Special thanks to the FluidSynth development team and contributors for maintaining such a powerful and versatile audio engine.
+* **[pyFluidSynth](https://github.com/amberwhitehead/pyfluidsynth)**: Python bindings for FluidSynth.
+* **[mido](https://github.com/mido/mido)**: MIDI objects for Python, used for parsing MIDI messages and tracks.
+
+---
+
 ## License
 
 Distributed under the GNU Lesser General Public License v3.0 (LGPLv3).
