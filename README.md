@@ -72,8 +72,8 @@ pip install mido pyFluidSynth
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/midiplayer-term.git
-   cd midiplayer-term
+   git clone https://github.com/loridj11/CLI-midi-player.git
+   cd CLI-midi-player
    ```
 
 2. Ensure the dependencies are installed:
