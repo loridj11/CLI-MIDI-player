@@ -1,6 +1,6 @@
 # 🎵 FluidSynth Terminal MIDI Player
 
-A lightweight, responsive, and elegant command-line MIDI player written in Python. It features a TUI (Terminal User Interface) built with `curses` and drives the **FluidSynth** audio synthesis engine via its interactive shell.
+A lightweight, responsive, and elegant command-line MIDI player written in Python. It features a TUI (Terminal User Interface) built with `curses` and drives the **FluidSynth** audio synthesis engine via its Python bindings (`pyFluidSynth`).
 
 ---
 
@@ -20,7 +20,7 @@ Tested under strict Linux `systemd-run` cgroup limits:
   * **Karaoke / Lyrics**: Extraction and synchronized display of lyrics and metadata (`title`, `copyright`, `lyrics`/`text`).
   * **Progress Bar**: Monitoring with elapsed time and total duration timestamps.
 * **Advanced Playback Controls**:
-  * Play, pause, restart, and fast forward/rewind ($\pm 5$ seconds).
+  * Play, pause, restart, and fast forward/rewind (± 5 seconds).
   * Dynamic adjustment of **playback speed** (from `0.25x` to `3.00x`).
   * On-the-fly **volume / gain** control.
 * **Practice Mode (MIDI Channel Mute)**:
@@ -31,20 +31,18 @@ Tested under strict Linux `systemd-run` cgroup limits:
   * Support for **Shuffle** and **Loop** modes (Off, Loop All, Loop Single).
 * **Persistent Configuration**:
   * Automatically saves the last used SoundFont and directory in `~/.config/midiplayer/config.json`.
-* **Built-in Audio Troubleshooting**:
-  * Dedicated command-line parameters to tune audio buffers and eliminate crackling or popping on slower systems or setups using PipeWire/PulseAudio/ALSA.
 
 ---
 
 ## System Requirements
 
-### 1. FluidSynth ($\ge$ 2.2.0 recommended)
-The program requires the `fluidsynth` binary to be installed and available in your system's `PATH`.
+### 1. FluidSynth
+The program requires the `libfluidsynth` native system library to be installed on your system.
 
 * **Debian / Ubuntu**:
   ```bash
   sudo apt update
-  sudo apt install fluidsynth fluid-soundfont-gm
+  sudo apt install libfluidsynth3 fluid-soundfont-gm
   ```
 * **Arch Linux**:
   ```bash
@@ -55,16 +53,17 @@ The program requires the `fluidsynth` binary to be installed and available in yo
   brew install fluid-synth
   ```
 
-> **Note**: Dynamic tempo control (`player_tempo_int`) requires FluidSynth version **2.2.0** or higher. All other features are compatible with older versions.
-
 ### 2. SoundFont (.sf2)
 A General MIDI SoundFont file in `.sf2` format is required (e.g., `FluidR3_GM.sf2`, which is often installed by the packages above, or any custom SoundFont).
 
 ### 3. Python Dependencies
-The project relies mostly on the Python standard library (`curses`, `subprocess`, `json`, `argparse`, etc.) and requires only one external dependency:
+The project relies mostly on the Python standard library (`curses`, `json`, `argparse`, etc.) and requires the following external dependencies:
+
+* `mido`
+* `pyFluidSynth`
 
 ```bash
-pip install mido
+pip install mido pyFluidSynth
 ```
 
 ---
@@ -79,7 +78,7 @@ pip install mido
 
 2. Ensure the dependencies are installed:
    ```bash
-   pip install mido
+   pip install mido pyFluidSynth
    ```
 
 3. Make the script executable (optional):
@@ -110,9 +109,9 @@ python3 midiplayer.py
   python3 midiplayer.py --soundfont /path/to/FluidR3_GM.sf2 --dir ./my_music
   ```
 
-* **Launch with specific audio driver and loop enabled:**
+* **Launch with loop enabled:**
   ```bash
-  python3 midiplayer.py --soundfont /path/to/FluidR3_GM.sf2 --dir ./midi --audio-driver pulseaudio --loop all --shuffle
+  python3 midiplayer.py --soundfont /path/to/FluidR3_GM.sf2 --dir ./midi --loop all --shuffle
   ```
 
 ---
@@ -129,10 +128,8 @@ python3 midiplayer.py
 | `↑` / `↓` | Navigate the playlist (visual selection) |
 | `ENTER` | Start playing the selected track in the playlist |
 | `+` / `-` | Increase / decrease volume (Gain) |
-| `<` / `>` | Slow down / speed up playback ($0.25x \dots 3.00x$) |
-| `L` | Toggle Loop mode (`Off` $
-ightarrow$ `All` $
-ightarrow$ `Single`) |
+| `<` / `>` | Slow down / speed up playback (0.25x ... 3.00x) |
+| `L` | Toggle Loop mode (`Off` -> `All` -> `Single`) |
 | `S` | Enable / disable random playback (`Shuffle`) |
 | `1` – `9` | Mute / unmute MIDI channels 1 to 9 |
 | `0` | Mute / unmute MIDI channel 10 (Percussion / Drums) |
@@ -141,40 +138,11 @@ ightarrow$ `Single`) |
 
 ---
 
-## Audio Troubleshooting (Stuttering / Lag / Distortion)
-
-If you experience audio crackling or popping (*buffer underruns*), you can tune the audio output using the advanced flags provided by the script:
-
-1. **Increase audio buffer size**:
-   ```bash
-   python3 midiplayer.py --period-size 2048 --periods 6
-   ```
-2. **Lock the sample rate** (especially useful with PipeWire):
-   ```bash
-   python3 midiplayer.py --sample-rate 48000
-   ```
-3. **Reduce output volume** to avoid clipping/distortion:
-   ```bash
-   python3 midiplayer.py --gain 0.3
-   ```
-4. **Disable effects** (reverb and chorus) on low-power systems:
-   ```bash
-   python3 midiplayer.py --no-effects
-   ```
-5. **Specify an alternative audio driver**:
-   ```bash
-   python3 midiplayer.py --audio-driver pulseaudio   # or alsa, pipewire, coreaudio, dsound
-   ```
-
----
-
 ## Command Line Options
 
 ```
 Usage: midiplayer.py [-h] [--dir DIR] [--soundfont SOUNDFONT]
-                     [--audio-driver AUDIO_DRIVER] [--gain GAIN]
-                     [--period-size PERIOD_SIZE] [--periods PERIODS]
-                     [--sample-rate SAMPLE_RATE] [--no-effects]
+                     [--gain GAIN]
                      [--shuffle] [--loop {off,all,single}]
                      [files ...]
 
@@ -184,18 +152,17 @@ Positional arguments:
 General options:
   --dir DIR             Directory containing .mid/.midi files
   --soundfont SOUNDFONT Path to the SoundFont file (.sf2)
-  --audio-driver DRIVER Audio driver for FluidSynth (e.g., alsa, pulseaudio, coreaudio)
   --gain GAIN           Initial audio gain (default: 0.5)
   --shuffle             Start the playlist in shuffle mode
   --loop {off,all,single}
                         Initial loop mode (default: off)
-
-Performance and Audio Buffers:
-  --period-size SIZE    Audio buffer size in frames (default: 1024)
-  --periods PERIODS     Number of audio buffers (default: 4)
-  --sample-rate RATE    Force the sample rate (e.g., 44100 or 48000)
-  --no-effects          Disable reverb and chorus to save CPU
 ```
+
+---
+
+## Legacy CLI Version
+
+In the releases section of this repository, you can find older versions of this tool that utilize the `fluidsynth` CLI executable as an external process (via `subprocess`). Please note that this legacy version is now considered obsolete, is no longer supported, and will not receive any future updates.
 
 ---
 

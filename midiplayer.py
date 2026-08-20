@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
-midiplayer.py - Player MIDI da terminale basato su FluidSynth
-================================================================
+midiplayer.py - Player MIDI da terminale basato su FluidSynth (pyfluidsynth)
+=============================================================================
 
-Riproduce file .mid/.midi usando il binario "fluidsynth" come motore
-audio, pilotato tramite la sua shell interattiva (comandi player_*
-disponibili da FluidSynth 2.2.0 in poi).
+Riproduce file .mid/.midi usando FluidSynth tramite i binding Python
+"pyfluidsynth" (chiamate dirette a libfluidsynth, nessun processo esterno
+e nessun parsing di comandi testuali). Il file MIDI viene letto una sola
+volta con "mido": la stessa sequenza di eventi alimenta sia il motore di
+riproduzione (un thread dedicato che invia gli eventi al synth rispettando
+i tempi) sia le informazioni mostrate a schermo (note attive, accordi,
+testi karaoke).
 
 Requisiti:
-    - fluidsynth installato e nel PATH (versione >= 2.2.0 per il controllo
-      di velocità "player_tempo_int"; le altre funzioni lavorano anche con
-      versioni precedenti)
-        Debian/Ubuntu: sudo apt install fluidsynth fluid-soundfont-gm
-        Arch:          sudo pacman -S fluidsynth soundfont-fluid
+    - libreria di sistema libfluidsynth (la libreria, non necessariamente
+      il comando a riga di comando "fluidsynth")
+        Debian/Ubuntu: sudo apt install libfluidsynth3   (o: fluidsynth)
+        Arch:          sudo pacman -S fluidsynth
         macOS:         brew install fluid-synth
-    - un SoundFont (.sf2), es. FluidR3_GM.sf2
-    - libreria python "mido" per leggere durata/tempo/metadati dei file MIDI
+    - libreria python "pyfluidsynth" (binding a libfluidsynth)
+        pip install pyFluidSynth
+    - libreria python "mido" per leggere/interpretare i file MIDI
         pip install mido
+    - un SoundFont (.sf2), es. FluidR3_GM.sf2
 
 Uso:
     python3 midiplayer.py
@@ -28,6 +33,11 @@ Uso:
     python3 midiplayer.py --soundfont /percorso/FluidR3_GM.sf2 --dir ./cartella_midi
     python3 midiplayer.py --soundfont /percorso/FluidR3_GM.sf2 --dir ./midi --audio-driver pulseaudio
 
+    Esportazione offline in WAV (nessuna interfaccia, rendering più veloce
+    del tempo reale perché non passa dalla scheda audio):
+    python3 midiplayer.py --soundfont FluidR3_GM.sf2 brano.mid --export brano.wav
+    python3 midiplayer.py --soundfont FluidR3_GM.sf2 --dir ./midi --export ./wav_out/
+
 Comandi da tastiera:
     SPAZIO      Pausa / Riprendi
     <- / ->     Indietro / Avanti di 5 secondi nel brano corrente
@@ -38,19 +48,22 @@ Comandi da tastiera:
     INVIO       Riproduce il brano selezionato nella playlist
     + / -       Alza / abbassa il volume (PagSu/PagGiu equivalenti)
     < / >       Rallenta / velocizza la riproduzione
+    [ / ]       Trasponi giù / su di un semitono (fino a +-24)
     L           Cambia modalità di ripetizione (Off -> Tutti -> Singolo)
     S           Attiva/disattiva la riproduzione casuale (Shuffle)
     1-9, 0      Silenzia/riattiva il canale MIDI 1-10 (0 = canale 10,
                 di solito le percussioni) - utile come base per esercitarsi
     F1-F6       Silenzia/riattiva i canali MIDI 11-16
+    F7          Cambia SoundFont a caldo (chiede il percorso del nuovo .sf2)
+    P           Cambia lo strumento (Program Change) di un canale
+                (chiede "canale programma", es. "1 41" = canale 1, programma 41)
     Q           Esci
 
 Durante la riproduzione vengono mostrate anche le note attualmente in
-esecuzione (calcolate leggendo in anticipo il file MIDI, canale
-percussioni escluso), l'accordo riconosciuto (con eventuale rivolto,
-es. "Do maj / Mi" quando il basso non è la fondamentale), il titolo e
-l'autore/copyright letti dai metadati del file e, quando presenti, i
-testi (lyrics) sincronizzati come in un karaoke.
+esecuzione (canale percussioni escluso), l'accordo riconosciuto (con
+eventuale rivolto, es. "Do maj / Mi"), una mini piano-roll ASCII con le
+note in arrivo, il titolo e l'autore/copyright letti dai metadati del
+file e, quando presenti, i testi (lyrics) sincronizzati come in un karaoke.
 
 Se l'audio gracchia/distorce:
     - aumenta il buffer: --period-size 2048 --periods 6 (o valori più alti)
@@ -62,20 +75,35 @@ Se l'audio gracchia/distorce:
 """
 
 import argparse
+import bisect
+import contextlib
 import curses
 import json
 import os
 import random
 import shlex
-import shutil
-import subprocess
 import sys
+import threading
 import time
+import wave
 
 try:
     import mido
 except ImportError:
     print("Questo programma richiede la libreria 'mido'.\nInstallala con: pip install mido")
+    sys.exit(1)
+
+try:
+    import fluidsynth
+except ImportError:
+    print(
+        "Questo programma richiede la libreria 'pyfluidsynth' (i binding Python di FluidSynth).\n"
+        "Installala con: pip install pyFluidSynth\n\n"
+        "Serve anche la libreria di sistema libfluidsynth (non il comando a riga di comando):\n"
+        "    Debian/Ubuntu: sudo apt install libfluidsynth3   (o: fluidsynth)\n"
+        "    Arch:          sudo pacman -S fluidsynth\n"
+        "    macOS:         brew install fluid-synth\n"
+    )
     sys.exit(1)
 
 
@@ -95,6 +123,15 @@ GAIN_MAX = 2.0
 SPEED_STEP = 0.05
 SPEED_MIN = 0.25
 SPEED_MAX = 3.0
+
+TRANSPOSE_STEP = 1
+TRANSPOSE_MIN = -24
+TRANSPOSE_MAX = 24
+
+PIANO_ROLL_ROWS = 6
+PIANO_ROLL_LOOKAHEAD = 2.5  # secondi di "anticipo" mostrati nella piano roll
+PIANO_ROLL_START_OCTAVE = 1  # ottava più bassa mostrata (1 = Do1/nota MIDI 24)
+PIANO_ROLL_NUM_OCTAVES = 6   # quante ottave mostrare: modifica questo valore per ampliare/restringere la piano roll
 
 CONFIG_PATH = os.path.expanduser("~/.config/midiplayer/config.json")
 
@@ -141,7 +178,7 @@ NOTE_NAMES = ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", 
 
 # Canale MIDI 10 (indice 9) è convenzionalmente riservato alla batteria/percussioni:
 # i "note number" lì indicano lo strumento percosso, non un'altezza musicale,
-# quindi lo escludiamo dal riconoscimento di note/accordi.
+# quindi lo escludiamo dal riconoscimento di note/accordi e dalla piano roll.
 PERCUSSION_CHANNEL = 9
 
 CHORD_TEMPLATES = [
@@ -163,6 +200,51 @@ CHORD_TEMPLATES = [
     ("sus4", (0, 5, 7)),
     ("sus2", (0, 2, 7)),
 ]
+
+# Peso di ogni intervallo (in semitoni dalla fondamentale) nel punteggio di
+# riconoscimento. Fondamentale e terza (maggiore/minore) sono le note che
+# definiscono l'identità dell'accordo: se mancano, il match viene scartato.
+# Settima e sesta sono "importanti" (definiscono l'estensione). La quinta
+# giusta è la nota più facilmente omessa in pratica (specialmente su
+# synth/tastiere, dove non aggiunge colore) e quindi ha il peso più basso:
+# la sua assenza costa poco e non deve far perdere all'accordo giusto contro
+# un template più povero. Le altre "quinte" caratteristiche (diminuita,
+# eccedente) e la quarta dei sus hanno peso medio, perché sono la nota che
+# distingue quei template da un semplice maj/min.
+INTERVAL_WEIGHT = {
+    0: 3,   # fondamentale
+    1: 2,   # 9a minore
+    2: 2,   # 9a
+    3: 3,   # 3a minore
+    4: 3,   # 3a maggiore
+    5: 2,   # 4a giusta (sus4)
+    6: 2,   # 5a diminuita (dim/m7b5)
+    7: 1,   # 5a giusta -> peso basso, è la nota più spesso omessa
+    8: 2,   # 5a eccedente (aug)
+    9: 2,   # 6a/13a
+    10: 2,  # 7a minore
+    11: 2,  # 7a maggiore
+}
+
+# Note "extra" rispetto al template di base: invece di penalizzarle sempre
+# allo stesso modo, se corrispondono a una tensione armonica riconoscibile
+# (9a, 11a, 13a o loro alterazioni) vengono riportate nel nome dell'accordo
+# invece di essere ignorate/penalizzate, es. "La 7 (b13)" invece di "La 7".
+EXTENSION_LABELS = {1: "b9", 2: "9", 3: "#9", 5: "11", 6: "#11", 8: "b13", 9: "13"}
+MAX_EXTENSIONS_SHOWN = 2  # oltre questa soglia l'accordo è troppo "sporco": non etichettare
+
+CHORD_MISSING_PENALTY_MULT = 1.5  # amplifica il costo dei toni mancanti in proporzione al loro peso
+CHORD_EXTRA_PENALTY = 1           # penalità per ogni nota extra SENZA un'etichetta di tensione nota
+CHORD_MIN_COVERAGE = 0.45         # copertura minima (peso presente / peso totale template) per accettare
+
+# Spelling "a bemolle" per le fondamentali dei tasti neri dove è la grafia di
+# gran lunga più comune nei chart reali (Reb, Mib, Lab, Sib). Fa#/Solb resta
+# col diesis perché "Fa#" è la spellatura standard, specie per dim/m7b5.
+FLAT_ROOT_SPELLING = {1: "Reb", 3: "Mib", 8: "Lab", 10: "Sib"}
+
+
+def spell_root(pitch_class):
+    return FLAT_ROOT_SPELLING.get(pitch_class, NOTE_NAMES[pitch_class])
 
 
 def sanitize_text(text):
@@ -192,62 +274,149 @@ def guess_chord(notes):
     basso: se il basso non coincide con la fondamentale dell'accordo
     riconosciuto, il risultato viene mostrato come rivolto, es. "Do maj / Mi".
 
-    Il matching è basato su sottoinsiemi (subset) e non sull'uguaglianza
-    esatta: con accordi pianistici estesi su più ottave (raddoppi, note di
-    passaggio, tensioni non catalogate) le classi di altezza attive possono
-    essere molte più delle 3-5 previste dai template. Cerchiamo quindi, per
-    ogni possibile fondamentale, il template più esteso (specifico) che sia
-    interamente CONTENUTO tra le note suonate: eventuali note aggiuntive
-    vengono tollerate invece di far fallire il riconoscimento, mentre a
-    parità di specificità viene preferito il template la cui fondamentale
-    coincide con la nota al basso (ipotesi più probabile in posizione
-    fondamentale).
+    Il matching è a punteggio pesato (non a inclusione esatta): ogni
+    intervallo del template pesa in base a quanto è "identificativo"
+    dell'accordo (fondamentale/terza pesano molto, la quinta giusta pesa
+    poco perché è la prima nota che viene omessa nella pratica reale), e:
+      - le note del template presenti vengono premiate in base al loro peso;
+      - le note del template MANCANTI vengono penalizzate in proporzione al
+        loro peso (mancare la terza costa molto più che mancare la quinta);
+        se manca la fondamentale o la terza il match viene scartato del
+        tutto, perché senza quelle l'identità dell'accordo non è definita;
+      - le note suonate ma estranee al template vengono trattate in due modi
+        diversi: se corrispondono a una tensione armonica riconoscibile (9a,
+        11a, 13a o loro alterazioni) vengono riportate nel nome invece di
+        essere ignorate (es. "La 7 (b13)"); se invece non corrispondono a
+        nulla di riconoscibile (probabile nota di passaggio/melodia) ricevono
+        solo una lieve penalità, per non far scartare l'accordo giusto.
+    Vince il template con lo score più alto; a parità si preferisce quello
+    più esteso (specifico) e, a ulteriore parità, quello la cui fondamentale
+    coincide con la nota al basso (ipotesi più probabile in stato fondamentale).
+
+    Infine, alla fondamentale e all'eventuale nota al basso viene applicata
+    una spellatura "a bemolle" per i tasti neri dove è la grafia standard nei
+    chart reali (es. la radice sul semitono 10 diventa "Sib", non "La#").
     """
     notes = sorted(set(notes))
     if len(notes) < 2:
         return None
 
-    pitch_classes = sorted(set(n % 12 for n in notes))
+    pitch_classes = set(n % 12 for n in notes)
+    if len(pitch_classes) < 3:
+        # con meno di 3 classi di altezza distinte (es. un semplice intervallo
+        # di quinta, o solo ottave della stessa nota) non c'è abbastanza
+        # materiale per parlare di un vero accordo: meglio non azzardare
+        return None
     bass_pitch_class = min(notes) % 12
 
-    best = None  # (num_note_template, nome, root)
+    best = None  # (score, dimensione_template, nome, root, estensioni_etichettate)
     for root in pitch_classes:
-        intervals = set((pc - root) % 12 for pc in pitch_classes)
+        intervals_present = set((pc - root) % 12 for pc in pitch_classes)
         for name, template in CHORD_TEMPLATES:
             template_set = set(template)
-            if not template_set.issubset(intervals):
+            matched = template_set & intervals_present
+            missing = template_set - intervals_present
+            extra = intervals_present - template_set
+
+            # fondamentale o terza assenti -> il template non è credibile,
+            # indipendentemente da quanto "coprono" bene le altre note
+            if any(INTERVAL_WEIGHT[i] >= 3 for i in missing):
                 continue
-            score = len(template_set)
-            if best is None or score > best[0] or (
-                score == best[0] and root == bass_pitch_class and best[2] != bass_pitch_class
+
+            template_weight = sum(INTERVAL_WEIGHT[i] for i in template_set)
+            matched_weight = sum(INTERVAL_WEIGHT[i] for i in matched)
+            missing_weight = sum(INTERVAL_WEIGHT[i] for i in missing)
+            coverage = matched_weight / template_weight if template_weight else 0
+            if coverage < CHORD_MIN_COVERAGE:
+                continue
+
+            labeled_extras = sorted(i for i in extra if i in EXTENSION_LABELS)
+            unlabeled_extras = [i for i in extra if i not in EXTENSION_LABELS]
+
+            score = (
+                matched_weight
+                - CHORD_MISSING_PENALTY_MULT * missing_weight
+                - CHORD_EXTRA_PENALTY * len(unlabeled_extras)
+            )
+
+            candidate = (score, len(template_set), name, root, tuple(labeled_extras))
+            if best is None or candidate[:2] > best[:2] or (
+                candidate[:2] == best[:2] and root == bass_pitch_class and best[3] != bass_pitch_class
             ):
-                best = (score, name, root)
+                best = candidate
 
     if best is None:
         return None
 
-    _, name, root = best
-    chord_name = f"{NOTE_NAMES[root]} {name}"
+    _, _, name, root, labeled_extras = best
+    chord_name = f"{spell_root(root)} {name}"
+    if labeled_extras and len(labeled_extras) <= MAX_EXTENSIONS_SHOWN:
+        chord_name += f" ({','.join(EXTENSION_LABELS[i] for i in labeled_extras)})"
     if bass_pitch_class != root:
-        chord_name += f" / {NOTE_NAMES[bass_pitch_class]}"
+        chord_name += f" / {spell_root(bass_pitch_class)}"
     return chord_name
+
+
+# Tipi di messaggio "channel voice" che ci interessano per la riproduzione:
+# sono gli unici che il synth deve effettivamente ricevere.
+PLAYABLE_TYPES = ("note_on", "note_off", "control_change", "program_change", "pitchwheel")
+
+
+@contextlib.contextmanager
+def _suppress_native_output():
+    """Silenzia temporaneamente stderr a livello di file descriptor.
+
+    FluidSynth/GLib possono stampare avvisi (es. "Instrument not found...",
+    "SDL3 not initialized", "GLib-GObject-CRITICAL") scrivendo direttamente
+    sul file descriptor 2 (stderr) di sistema, bypassando sys.stdout/stderr
+    di Python: redirect_stdout/redirect_stderr non basterebbero a
+    nasconderli. Qui invece si duplica temporaneamente SOLO il file
+    descriptor 2 su /dev/null e lo si ripristina subito dopo.
+
+    Va toccato solo stderr e MAI stdout (fd 1): quando questa funzione
+    avvolge l'intera sessione curses, curses.wrapper() ha bisogno che fd 1
+    sia ancora il terminale vero per inizializzare lo schermo (cbreak()/
+    nocbreak() falliscono con "returned ERR" se fd 1 punta a /dev/null).
+    """
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr_fd = os.dup(2)
+    except OSError:
+        # su piattaforme dove non è possibile duplicare i file descriptor
+        # (raro), meglio mostrare i warning che far fallire l'avvio
+        yield
+        return
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(devnull_fd)
+        os.close(saved_stderr_fd)
 
 
 def analyze_midi(path):
     """Analizza un file MIDI ed estrae tutte le informazioni utili al player.
 
+    Un'unica lettura con "mido" alimenta sia la UI sia il motore di
+    riproduzione, eliminando la doppia analisi che serviva quando la
+    riproduzione vera e propria era delegata al player interno di
+    FluidSynth via CLI.
+
     Ritorna un dizionario con:
         duration        durata totale in secondi
-        ticks_per_beat  risoluzione del file
-        tempo           tempo iniziale (microsecondi per beat)
         note_events     lista ordinata di (tempo_secondi, 'on'/'off', canale, nota)
+                         usata dalla UI per note attive/accordi/piano roll
+        events          lista ordinata di (tempo_secondi, msg) con TUTTI i
+                         messaggi "channel voice" (note, cc, program change,
+                         pitch bend): è la sequenza che il player invia al synth
         title           titolo del brano (dal primo evento 'track_name' utile), o None
         author          autore/copyright (dal primo evento 'copyright'), o None
         lyrics          lista ordinata di (tempo_secondi, testo) per la modalità karaoke
     """
     empty = {
-        "duration": 0.0, "ticks_per_beat": 480, "tempo": 500000,
-        "note_events": [], "title": None, "author": None, "lyrics": [],
+        "duration": 0.0, "note_events": [], "events": [],
+        "title": None, "author": None, "lyrics": [],
     }
     try:
         mid = mido.MidiFile(path)
@@ -255,31 +424,28 @@ def analyze_midi(path):
         return empty
 
     duration = mid.length  # mido calcola già tenendo conto dei cambi di tempo
-    ticks_per_beat = mid.ticks_per_beat or 480
-
-    tempo = 500000  # default: 120 bpm
-    for track in mid.tracks:
-        for msg in track:
-            if msg.type == "set_tempo":
-                tempo = msg.tempo
-                break
-        else:
-            continue
-        break
 
     title = None
     author = None
     note_events = []
+    events = []
     lyric_events = []   # eventi 'lyrics' veri e propri (karaoke standard)
     text_events = []    # eventi 'text' generici, usati come ripiego
     elapsed = 0.0
     try:
-        for msg in mid:  # iterare su mid (non su mid.tracks) fonde le tracce e converte msg.time in secondi
+        # iterare su "mid" (non su mid.tracks) fonde le tracce, applica i
+        # cambi di tempo e converte msg.time in secondi: è lo stesso motivo
+        # per cui viene usato sia per l'analisi sia per pilotare il synth.
+        for msg in mid:
             elapsed += msg.time
             if msg.type == "note_on" and msg.velocity > 0:
                 note_events.append((elapsed, "on", msg.channel, msg.note))
+                events.append((elapsed, msg))
             elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
                 note_events.append((elapsed, "off", msg.channel, msg.note))
+                events.append((elapsed, msg))
+            elif msg.type in ("control_change", "program_change", "pitchwheel"):
+                events.append((elapsed, msg))
             elif msg.type == "track_name":
                 name = sanitize_text(msg.name)
                 if name and title is None:
@@ -298,6 +464,7 @@ def analyze_midi(path):
                     text_events.append((elapsed, text))
     except Exception:
         note_events = []
+        events = []
 
     # Alcuni file "karaoke" salvano i testi come semplici eventi 'text'
     # invece che 'lyrics': li usiamo solo se non ci sono lyrics vere e proprie.
@@ -305,30 +472,53 @@ def analyze_midi(path):
     lyrics.sort(key=lambda item: item[0])
 
     return {
-        "duration": duration, "ticks_per_beat": ticks_per_beat, "tempo": tempo,
-        "note_events": note_events, "title": title, "author": author, "lyrics": lyrics,
+        "duration": duration, "note_events": note_events, "events": events,
+        "title": title, "author": author, "lyrics": lyrics,
     }
 
 
 class FluidSynthTrack:
-    """Gestisce il processo fluidsynth per UN singolo file MIDI alla volta."""
+    """Pilota un'istanza di FluidSynth (via pyfluidsynth) per UN singolo file MIDI.
 
-    def __init__(self, soundfont, audio_driver, gain, logfile,
+    Non c'è più un processo esterno: gli eventi vengono inviati al synth da
+    un thread dedicato che rispetta i tempi del brano (accelerabili/
+    rallentabili a runtime tramite 'speed'). Operazioni come seek, mute di
+    un canale, trasposizione o cambio SoundFont ricostruiscono lo stato del
+    synth (programmi, controller, note eventualmente ancora suonanti)
+    all'istante corrente tramite _resync_state(), invece di limitarsi a
+    "saltare" nella sequenza.
+    """
+
+    def __init__(self, soundfont, audio_driver, gain,
                  period_size=1024, periods=4, sample_rate=None, no_effects=False):
-        self.soundfont = soundfont
+        self.soundfont_path = soundfont
         self.audio_driver = audio_driver
         self.gain = gain
-        self.logfile = logfile
         self.period_size = period_size
         self.periods = periods
-        self.sample_rate = sample_rate
+        self.sample_rate = sample_rate or 44100
         self.no_effects = no_effects
-        self.proc = None
+
+        with _suppress_native_output():
+            self.synth = fluidsynth.Synth(gain=gain, samplerate=float(self.sample_rate))
+            if period_size:
+                self.synth.setting("audio.period-size", period_size)
+            if periods:
+                self.synth.setting("audio.periods", periods)
+            if no_effects:
+                self.synth.setting("synth.reverb.active", 0)
+                self.synth.setting("synth.chorus.active", 0)
+            self.synth.start(driver=audio_driver)
+            self.sfid = self.synth.sfload(soundfont)
+        for ch in range(16):
+            self.synth.program_select(ch, self.sfid, 0, 0)
 
         self.duration = 0.0
-        self.ticks_per_beat = 480
-        self.tempo = 500000  # microsecondi per beat
         self.note_events = []
+        self.events = []
+        self._event_times = []
+        self._note_ons = []       # (tempo, nota) - solo note_on melodiche, per la piano roll
+        self._note_on_times = []
         self.title = None
         self.author = None
         self.lyrics = []
@@ -338,25 +528,33 @@ class FluidSynthTrack:
 
         # "Orologio" interno del brano: la posizione (in secondi "di brano")
         # viene ricostruita come song_pos_al_ancoraggio + tempo_reale_trascorso * velocità.
-        # Questo permette di tenere sincronizzati barra di progresso e testi
-        # anche quando la velocità di riproduzione cambia a runtime.
+        # Questo permette di tenere sincronizzati barra di progresso, testi e
+        # il thread di riproduzione anche quando la velocità cambia a runtime.
         self._song_pos = 0.0
         self._anchor = time.monotonic()
         self.speed = 1.0
+        self.transpose = 0
 
-        # Mute/Solo dei canali MIDI (modalità "esercizio"/backing track).
         self.muted_channels = set()
-        self._channel_volume = {}  # canale -> ultimo volume noto prima del mute
 
-    # ---- gestione processo -------------------------------------------------
+        self._gen = 0            # invalidato ad ogni start/seek/reposition
+        self._thread = None
+        self._stop_flag = False
+
+    # ---- gestione del thread di riproduzione --------------------------------
     def start(self, path):
-        self.stop_process()
+        self._stop_thread()
 
         info = analyze_midi(path)
         self.duration = info["duration"]
-        self.ticks_per_beat = info["ticks_per_beat"]
-        self.tempo = info["tempo"]
         self.note_events = info["note_events"]
+        self.events = info["events"]
+        self._event_times = [t for t, _ in self.events]
+        self._note_ons = [
+            (t, note) for t, kind, ch, note in self.note_events
+            if kind == "on" and ch != PERCUSSION_CHANNEL
+        ]
+        self._note_on_times = [t for t, _ in self._note_ons]
         self.title = info["title"]
         self.author = info["author"]
         self.lyrics = info["lyrics"]
@@ -366,101 +564,168 @@ class FluidSynthTrack:
         self._song_pos = 0.0
         self._anchor = time.monotonic()
 
-        cmd = ["fluidsynth", "-n", "-g", str(self.gain)]
-        if self.audio_driver:
-            cmd += ["-a", self.audio_driver]
-        if self.sample_rate:
-            cmd += ["-r", str(self.sample_rate)]
-        # Buffer audio più ampio: riduce (o elimina) il gracchiare dovuto a
-        # underrun. Ininfluente sulla precisione ritmica perché qui si
-        # riproducono sempre file (player interno), mai eventi MIDI live.
-        cmd += ["-o", f"audio.period-size={self.period_size}",
-                "-o", f"audio.periods={self.periods}"]
-        if self.no_effects:
-            # riverbero/chorus sono i consumatori di CPU più pesanti: disattivarli
-            # aiuta su macchine lente dove il gracchiare è dovuto a CPU satura
-            cmd += ["-R", "0", "-C", "0"]
-        cmd += [self.soundfont, path]
+        self._resync_state(0.0, retrigger_notes=False)
+        self._spawn_thread(0)
 
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=self.logfile,
-            stderr=self.logfile,
-            text=True,
-            bufsize=1,
+    def _spawn_thread(self, start_idx):
+        self._gen += 1
+        self._stop_flag = False
+        self._thread = threading.Thread(
+            target=self._playback_loop, args=(self._gen, start_idx), daemon=True
         )
+        self._thread.start()
 
-        # Il nuovo processo fluidsynth parte con velocità e canali "puliti":
-        # riapplichiamo le impostazioni persistenti scelte dall'utente.
-        if self.speed != 1.0:
-            self._send(f"player_tempo_int {self.speed:.2f}")
-        for channel in self.muted_channels:
-            self._send(f"cc {channel} 7 0")
+    def _stop_thread(self):
+        self._stop_flag = True
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
 
     def stop_process(self):
-        if self.proc and self.proc.poll() is None:
-            try:
-                self._send("quit")
-                self.proc.wait(timeout=1.5)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-        self.proc = None
+        self._stop_thread()
+        try:
+            self.synth.delete()
+        except Exception:
+            pass
 
-    def _send(self, cmd):
-        if self.proc and self.proc.stdin and self.proc.poll() is None:
+    def _playback_loop(self, gen, start_idx):
+        idx = start_idx
+        n = len(self.events)
+        while not self._stop_flag and gen == self._gen:
+            if self.paused:
+                time.sleep(0.01)
+                continue
+            if idx >= n:
+                time.sleep(0.05)
+                continue
+            t_event, msg = self.events[idx]
+            now = self.elapsed()
+            wait = (t_event - now) / max(self.speed, 0.0001)
+            if wait > 0.002:
+                time.sleep(min(wait, 0.02))
+                continue
             try:
-                self.proc.stdin.write(cmd + "\n")
-                self.proc.stdin.flush()
+                self._apply_message(msg)
             except Exception:
-                pass
+                pass  # un evento malformato non deve far crashare il player
+            idx += 1
+
+    def _apply_message(self, msg):
+        ch = msg.channel
+        if msg.type == "note_on" and msg.velocity > 0:
+            if ch in self.muted_channels:
+                return
+            note = msg.note + self.transpose
+            if 0 <= note <= 127:
+                self.synth.noteon(ch, note, msg.velocity)
+        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            note = msg.note + self.transpose
+            if 0 <= note <= 127:
+                self.synth.noteoff(ch, note)
+        elif msg.type == "control_change":
+            self.synth.cc(ch, msg.control, msg.value)
+        elif msg.type == "program_change":
+            self.synth.program_change(ch, msg.program)
+        elif msg.type == "pitchwheel":
+            # fluid_synth_pitch_bend vuole un valore 0..16383 centrato su 8192,
+            # mentre mido usa -8192..8191 centrato su 0.
+            self.synth.pitch_bend(ch, msg.pitch + 8192)
+
+    def _resync_state(self, target_time, retrigger_notes=True):
+        """Ricostruisce lo stato del synth (programmi, controller, pitch bend,
+        note ancora suonanti) come sarebbe all'istante target_time, rigiocando
+        gli eventi del file fino a quel punto. Necessario dopo un seek/mute/
+        trasposizione: senza, si perderebbero lo strumento giusto sul canale,
+        volume/pan, o le note che dovrebbero essere ancora attive.
+        """
+        self.synth.system_reset()
+        for ch in range(16):
+            self.synth.program_select(ch, self.sfid, 0, 0)
+            # Il volume di canale (CC7) è uno dei controller che lo spec MIDI
+            # esclude esplicitamente da "Reset All Controllers": system_reset()
+            # non lo riporta al default. Se non lo fissiamo qui a mano, un
+            # canale mutato (cc7=0) e mai toccato da un CC7 nel file resta a
+            # volume zero per sempre anche dopo lo smute, perché più sotto
+            # verrebbe rigiocato solo ciò che il file imposta esplicitamente.
+            self.synth.cc(ch, 7, 100)
+
+        active = {}       # (canale, nota) -> velocity
+        last_program = {}  # canale -> programma
+        last_cc = {}       # (canale, controller) -> valore
+        last_pitch = {}    # canale -> pitch (valore mido, -8192..8191)
+
+        end_idx = bisect.bisect_right(self._event_times, target_time)
+        for t, msg in self.events[:end_idx]:
+            ch = msg.channel
+            if msg.type == "note_on" and msg.velocity > 0:
+                active[(ch, msg.note)] = msg.velocity
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                active.pop((ch, msg.note), None)
+            elif msg.type == "control_change":
+                last_cc[(ch, msg.control)] = msg.value
+            elif msg.type == "program_change":
+                last_program[ch] = msg.program
+            elif msg.type == "pitchwheel":
+                last_pitch[ch] = msg.pitch
+
+        for ch, prog in last_program.items():
+            self.synth.program_change(ch, prog)
+        for (ch, control), value in last_cc.items():
+            self.synth.cc(ch, control, value)
+        for ch, pitch in last_pitch.items():
+            self.synth.pitch_bend(ch, pitch + 8192)
+        # i canali mutati restano a volume 0 indipendentemente da cosa dice il file
+        for ch in self.muted_channels:
+            self.synth.cc(ch, 7, 0)
+
+        if retrigger_notes:
+            for (ch, note), vel in active.items():
+                if ch in self.muted_channels:
+                    continue
+                tn = note + self.transpose
+                if 0 <= tn <= 127:
+                    self.synth.noteon(ch, tn, vel)
+
+    def _reposition(self, target_time):
+        """Ferma il thread di riproduzione, ricostruisce lo stato del synth a
+        target_time e lo fa ripartire da lì. Usato da seek/restart/mute/
+        trasposizione/cambio SoundFont: è l'unico punto che sa come
+        riallineare in modo coerente audio e stato interno."""
+        self._stop_flag = True
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+        self._resync_state(target_time, retrigger_notes=not self.paused)
+        self._song_pos = target_time
+        self._anchor = time.monotonic()
+
+        idx = bisect.bisect_left(self._event_times, target_time)
+        self._spawn_thread(idx)
 
     # ---- controlli di riproduzione ------------------------------------------
     def pause(self):
         if not self.paused:
             self._song_pos = self.elapsed()
             self.paused = True
-            self._send("player_stop")
+            for ch in range(16):
+                self.synth.cc(ch, 123, 0)  # All Notes Off: silenzia subito ciò che suona
 
     def resume(self):
         if self.paused:
             self._anchor = time.monotonic()
             self.paused = False
-            self._send("player_cont")
 
     def toggle_pause(self):
         self.pause() if not self.paused else self.resume()
 
     def restart(self):
-        self._song_pos = 0.0
-        self._anchor = time.monotonic()
-        self.paused = False
-        self.finished = False
-        self._send("player_start")
-        if self.speed != 1.0:
-            self._send(f"player_tempo_int {self.speed:.2f}")
+        self._reposition(0.0)
 
     def seek(self, delta_seconds):
         current = self.elapsed()
         target = max(0.0, min(self.duration, current + delta_seconds))
-        actual_delta = target - current
-        if actual_delta == 0:
-            return
-
-        beats_per_second = 1_000_000 / self.tempo
-        ticks_per_second = beats_per_second * self.ticks_per_beat
-        tick_delta = int(round(actual_delta * ticks_per_second))
-        if tick_delta == 0:
-            return
-
-        self._song_pos = target
-        self._anchor = time.monotonic()
-
-        sign = "+" if tick_delta > 0 else ""
-        self._send(f"player_seek {sign}{tick_delta}")
+        if target != current:
+            self._reposition(target)
 
     def elapsed(self):
         if self.paused:
@@ -470,12 +735,14 @@ class FluidSynthTrack:
     def is_song_over(self):
         return (not self.paused) and self.duration > 0 and self.elapsed() >= self.duration
 
-    # ---- volume --------------------------------------------------------------
+    # ---- volume ---------------------------------------------------------------
     def change_gain(self, delta):
         self.gain = max(GAIN_MIN, min(GAIN_MAX, self.gain + delta))
-        self._send(f"gain {self.gain:.2f}")
+        # 'synth.gain' è una impostazione di FluidSynth modificabile in tempo
+        # reale: non serve ricreare il synth né inviare comandi separati.
+        self.synth.setting("synth.gain", self.gain)
 
-    # ---- velocità di riproduzione ---------------------------------------------
+    # ---- velocità di riproduzione -----------------------------------------------
     def change_speed(self, delta):
         # arrotondiamo per restare sempre sulla stessa "griglia" di valori
         # (altrimenti gli errori di virgola mobile o un valore di clamp non
@@ -485,11 +752,21 @@ class FluidSynthTrack:
         if new_speed == self.speed:
             return
         # "congela" la posizione corrente nel brano prima di cambiare velocità,
-        # così elapsed() resta coerente e sincronizzato con l'audio reale.
+        # così elapsed() resta coerente: qui non serve toccare il synth, la
+        # velocità è solo un fattore usato per calcolare i tempi di attesa.
         self._song_pos = self.elapsed()
         self._anchor = time.monotonic()
         self.speed = new_speed
-        self._send(f"player_tempo_int {self.speed:.2f}")
+
+    # ---- trasposizione ----------------------------------------------------------
+    def change_transpose(self, delta):
+        new_t = max(TRANSPOSE_MIN, min(TRANSPOSE_MAX, self.transpose + delta))
+        if new_t == self.transpose:
+            return
+        self.transpose = new_t
+        # ririgioca lo stato corrente così le note eventualmente già suonanti
+        # vengono subito ritrasposte, invece di aspettare le prossime note_on
+        self._reposition(self.elapsed())
 
     # ---- note e accordi --------------------------------------------------------
     def active_notes(self):
@@ -525,11 +802,32 @@ class FluidSynthTrack:
     def toggle_channel_mute(self, channel):
         if channel in self.muted_channels:
             self.muted_channels.discard(channel)
-            volume = self._channel_volume.get(channel, 100)
-            self._send(f"cc {channel} 7 {volume}")
         else:
             self.muted_channels.add(channel)
-            self._send(f"cc {channel} 7 0")
+        self._reposition(self.elapsed())
+
+    # ---- SoundFont e strumenti ---------------------------------------------------
+    def change_soundfont(self, path):
+        """Carica un nuovo SoundFont a caldo, senza riavviare il programma."""
+        if not os.path.isfile(path):
+            return False
+        with _suppress_native_output():
+            new_id = self.synth.sfload(path)
+        if new_id == -1:
+            return False
+        old_id = self.sfid
+        self.sfid = new_id
+        self.soundfont_path = path
+        self._reposition(self.elapsed())
+        try:
+            self.synth.sfunload(old_id)
+        except Exception:
+            pass
+        return True
+
+    def set_program(self, channel, program):
+        """Program Change manuale su un canale (es. per cambiare strumento al volo)."""
+        self.synth.program_change(channel, program)
 
 
 class Playlist:
@@ -599,18 +897,127 @@ def draw_progress_bar(width, fraction):
     return "#" * filled + "-" * (width - filled)
 
 
-def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
+def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None):
+    """Disegna una riga solo se il contenuto (testo+attributo+colonna) è
+    cambiato rispetto al frame precedente. Evita l'erase()+redraw completo
+    ad ogni ciclo (150ms), che genera flickering e consuma CPU inutilmente:
+    aggiorna solo le righe le cui variabili sono realmente cambiate.
+
+    'key' identifica la voce nella cache: di default è il numero di riga,
+    utile quando più chiamate concorrono sullo stesso numero di riga fisica
+    (qui non serve più per la piano roll, ma resta comodo in generale).
+    """
+    cache_key = row if key is None else key
+    entry = (col, text, attr)
+    if cache.get(cache_key) == entry:
+        return
+    try:
+        stdscr.move(row, col)
+        stdscr.clrtoeol()
+        stdscr.addstr(row, col, text, attr)
+    except curses.error:
+        pass
+    cache[cache_key] = entry
+
+
+PITCH_CLASS_LABELS = ["Do", "D#", "Re", "R#", "Mi", "Fa", "F#", "So", "S#", "La", "L#", "Si"]
+
+
+def render_piano_roll(stdscr, cache, track, row0, col0, width):
+    """Disegna una mini piano-roll ASCII a colonne fisse: ogni colonna
+    rappresenta sempre la stessa nota (non si sposta seguendo cosa sta
+    suonando in quel momento, altrimenti sarebbe impossibile seguirla a
+    colpo d'occhio) e in basso è etichettata con il nome della nota
+    ("Do", "D#", "Re", ...). Il pallino 'o' scende riga dopo riga man mano
+    che il momento in cui la nota suona si avvicina; quando la nota suona
+    davvero, sull'ultima riga (in grassetto) appare '#'.
+
+    L'intervallo mostrato è sempre lo stesso per ogni brano: va dall'ottava
+    PIANO_ROLL_START_OCTAVE per PIANO_ROLL_NUM_OCTAVES ottave (per default
+    Do1-Si6), indipendentemente dal range di note effettivamente presenti
+    nel file. Modificare quelle due costanti in cima al file per cambiare
+    l'ampiezza mostrata.
+    """
+    draw_line(stdscr, cache, row0, col0, "Piano roll:", curses.A_UNDERLINE)
+
+    low_note = (PIANO_ROLL_START_OCTAVE + 1) * 12          # es. ottava 1 -> nota MIDI 24 (Do1)
+    lanes = PIANO_ROLL_NUM_OCTAVES * 12
+    high_note = low_note + lanes - 1
+
+    # larghezza di colonna: abbastanza per l'etichetta ("Do", "D#", ...) ma
+    # ridotta automaticamente se lo spazio disponibile non basta per
+    # l'intero intervallo di ottave richiesto (la riga viene poi troncata
+    # alla larghezza reale del terminale, non deformata).
+    lane_width = max(2, min(4, width // max(1, lanes)))
+
+    t_now = track.elapsed()
+    lo = bisect.bisect_left(track._note_on_times, t_now)
+    hi = bisect.bisect_right(track._note_on_times, t_now + PIANO_ROLL_LOOKAHEAD)
+    upcoming = track._note_ons[lo:hi]
+    active_now = {n for _, n in track.active_notes()}
+
+    for r in range(PIANO_ROLL_ROWS):
+        is_now_row = r == PIANO_ROLL_ROWS - 1
+        delta = PIANO_ROLL_LOOKAHEAD * (PIANO_ROLL_ROWS - 1 - r) / max(1, PIANO_ROLL_ROWS - 1)
+        slice_t = t_now + delta
+        chars = []
+        for note in range(low_note, low_note + lanes):
+            if is_now_row and note in active_now:
+                symbol = "#"
+            elif not is_now_row and any(
+                n == note and abs(t - slice_t) <= PIANO_ROLL_LOOKAHEAD / (2 * PIANO_ROLL_ROWS)
+                for t, n in upcoming
+            ):
+                symbol = "o"
+            else:
+                symbol = " "  # colonna vuota: niente puntini quando non c'è nulla in arrivo
+            chars.append(symbol.ljust(lane_width))  # il resto della colonna resta spazio, per distanziare
+        line = "".join(chars)[:width]
+        draw_line(stdscr, cache, row0 + 1 + r, col0, line,
+                  curses.A_BOLD if is_now_row else curses.A_NORMAL, key=("pianoroll_row", r))
+
+    labels = "".join(PITCH_CLASS_LABELS[note % 12].ljust(lane_width) for note in range(low_note, low_note + lanes))
+    draw_line(stdscr, cache, row0 + 1 + PIANO_ROLL_ROWS, col0, labels[:width], curses.A_DIM, key="pianoroll_labels")
+
+
+def curses_prompt(stdscr, message):
+    """Chiede una riga di testo all'utente restando dentro la sessione curses
+    (usato per il percorso di un nuovo SoundFont o per un Program Change)."""
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    curses.echo()
+    curses.curs_set(1)
+    h, w = stdscr.getmaxyx()
+    try:
+        stdscr.move(h - 1, 2)
+        stdscr.clrtoeol()
+        stdscr.addstr(h - 1, 2, message)
+        stdscr.refresh()
+        raw = stdscr.getstr(h - 1, 2 + len(message), 200)
+        text = raw.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        text = ""
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(150)
+    return text
+
+
+def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
            period_size, periods, sample_rate, no_effects):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)  # ms, controlla anche il refresh della UI
 
-    track = FluidSynthTrack(soundfont, audio_driver, gain, logfile,
+    track = FluidSynthTrack(soundfont, audio_driver, gain,
                              period_size=period_size, periods=periods,
                              sample_rate=sample_rate, no_effects=no_effects)
     track.start(playlist.current)
 
     status_msg = ""
+    render_cache = {}
+    prev_size = stdscr.getmaxyx()
 
     def load_index(i):
         playlist.index = i
@@ -619,43 +1026,49 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
 
     try:
         while True:
-            stdscr.erase()
             h, w = stdscr.getmaxyx()
+            if (h, w) != prev_size:
+                # ridimensionamento del terminale: qui un erase() completo è
+                # necessario (e accade di rado, quindi non pesa sulla CPU)
+                stdscr.erase()
+                render_cache.clear()
+                prev_size = (h, w)
 
             title_bar = " MIDI Player (FluidSynth) "
-            stdscr.addstr(0, max(0, (w - len(title_bar)) // 2), title_bar, curses.A_BOLD)
+            draw_line(stdscr, render_cache, 0, max(0, (w - len(title_bar)) // 2), title_bar, curses.A_BOLD)
 
             row = 2
             display_title = track.title or os.path.basename(playlist.current)
-            stdscr.addstr(row, 2, f"In riproduzione: {display_title}"[: w - 4])
+            draw_line(stdscr, render_cache, row, 2, f"In riproduzione: {display_title}"[: w - 4])
             row += 1
-            if track.author:
-                stdscr.addstr(row, 2, f"Autore/copyright: {track.author}"[: w - 4])
-                row += 1
-            row += 1
+            draw_line(stdscr, render_cache, row, 2,
+                      (f"Autore/copyright: {track.author}" if track.author else "")[: w - 4])
+            row += 2
 
             elapsed = track.elapsed()
             total = track.duration
             bar_width = max(10, w - 20)
             bar = draw_progress_bar(bar_width, elapsed / total if total else 0)
-            stdscr.addstr(row, 2, f"{format_time(elapsed)} [{bar}] {format_time(total)}"[: w - 2])
+            draw_line(stdscr, render_cache, row, 2,
+                      f"{format_time(elapsed)} [{bar}] {format_time(total)}"[: w - 2])
             row += 2
 
             state = "PAUSA" if track.paused else "PLAY"
-            stdscr.addstr(row, 2, f"Stato: {state}")
+            draw_line(stdscr, render_cache, row, 2, f"Stato: {state}")
             row += 1
 
-            loop_line = (f"Volume: {track.gain:.2f}  Velocita': {track.speed:.2f}x  "
+            info_line = (f"Volume: {track.gain:.2f}  Velocita': {track.speed:.2f}x  "
+                         f"Trasposizione: {track.transpose:+d}  "
                          f"Loop: {LOOP_LABELS[playlist.loop_mode]}  "
                          f"Shuffle: {'ON' if playlist.shuffle else 'OFF'}")
-            stdscr.addstr(row, 2, loop_line[: w - 4])
+            draw_line(stdscr, render_cache, row, 2, info_line[: w - 4])
             row += 1
 
             if track.muted_channels:
                 muted_str = ", ".join(str(c + 1) for c in sorted(track.muted_channels))
             else:
                 muted_str = "-"
-            stdscr.addstr(row, 2, f"Canali mutati: {muted_str}"[: w - 4])
+            draw_line(stdscr, render_cache, row, 2, f"Canali mutati: {muted_str}"[: w - 4])
             row += 1
 
             active = track.active_notes()
@@ -664,33 +1077,32 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
                 notes_line = "Note: " + ", ".join(names)
             else:
                 notes_line = "Note: -"
-            stdscr.addstr(row, 2, notes_line[: w - 4])
+            draw_line(stdscr, render_cache, row, 2, notes_line[: w - 4])
             row += 1
 
             chord = guess_chord(note for _, note in active) if len(active) >= 2 else None
             chord_line = f"Accordo: {chord}" if chord else "Accordo: -"
-            stdscr.addstr(row, 2, chord_line[: w - 4])
+            draw_line(stdscr, render_cache, row, 2, chord_line[: w - 4])
             row += 1
 
-            lyric = track.current_lyric()
-            if lyric:
-                # Il simbolo unicode ♪ può non essere disponibile su terminali
-                # non-UTF8 o su build di curses non linkate con ncursesw: in tal
-                # caso addstr solleva un'eccezione, che qui non deve mai far
-                # crashare il player (si ripiega su un prefisso ASCII).
-                try:
-                    stdscr.addstr(row, 2, f"\u266a {lyric}"[: w - 4], curses.A_BOLD)
-                except (curses.error, UnicodeError):
-                    try:
-                        stdscr.addstr(row, 2, f"> {lyric}"[: w - 4], curses.A_BOLD)
-                    except curses.error:
-                        pass
+            lyric = track.current_lyric() or ""
+            # Il simbolo unicode ♪ può non essere disponibile su terminali
+            # non-UTF8 o build di curses non linkate con ncursesw: in tal
+            # caso ripieghiamo su un prefisso ASCII senza far crashare il player.
+            lyric_text = f"\u266a {lyric}" if lyric else ""
+            try:
+                draw_line(stdscr, render_cache, row, 2, lyric_text[: w - 4], curses.A_BOLD)
+            except UnicodeError:
+                draw_line(stdscr, render_cache, row, 2, (f"> {lyric}" if lyric else "")[: w - 4], curses.A_BOLD)
             row += 2
 
-            stdscr.addstr(row, 2, "Playlist:", curses.A_UNDERLINE)
+            render_piano_roll(stdscr, render_cache, track, row, 2, w - 2)
+            row += PIANO_ROLL_ROWS + 3  # header + righe + etichette note + una riga di spaziatura
+
+            draw_line(stdscr, render_cache, row, 2, "Playlist:", curses.A_UNDERLINE)
             row += 1
             list_start_row = row
-            max_list_rows = max(1, h - list_start_row - 5)
+            max_list_rows = max(1, h - list_start_row - 7)
             for r, i in enumerate(range(len(playlist.files))):
                 if r >= max_list_rows:
                     break
@@ -698,19 +1110,21 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
                 marker = ">" if i == playlist.index else " "
                 attr = curses.A_REVERSE if i == playlist.selected else curses.A_NORMAL
                 line = f"{marker} {fname}"[: w - 4]
-                stdscr.addstr(list_start_row + r, 4, line, attr)
+                draw_line(stdscr, render_cache, list_start_row + r, 4, line, attr)
 
             help1 = "SPAZIO pausa | <- -> avanti/indietro 5s | N succ. | B prec. | R riavvia"
             help2 = "SU/GIU seleziona | INVIO riproduci | L loop | S shuffle"
-            help3 = "+/- volume | </> velocita' | 1-9,0 muta canale | F1-F6 canali 11-16 | Q esci"
-            if h > list_start_row + max_list_rows + 4:
-                stdscr.addstr(h - 4, 2, help1[: w - 4])
-                stdscr.addstr(h - 3, 2, help2[: w - 4])
-                stdscr.addstr(h - 2, 2, help3[: w - 4])
-            if status_msg:
-                stdscr.addstr(h - 1, 2, status_msg[: w - 4])
+            help3 = "+/- volume | </> velocita' | ]/[ trasposizione | P programma canale"
+            help4 = "1-9,0 muta canale | F1-F6 canali 11-16 | F7 SoundFont | Q esci"
+            if h > list_start_row + max_list_rows + 5:
+                draw_line(stdscr, render_cache, h - 5, 2, help1[: w - 4])
+                draw_line(stdscr, render_cache, h - 4, 2, help2[: w - 4])
+                draw_line(stdscr, render_cache, h - 3, 2, help3[: w - 4])
+                draw_line(stdscr, render_cache, h - 2, 2, help4[: w - 4])
+            draw_line(stdscr, render_cache, h - 1, 2, status_msg[: w - 4])
 
-            stdscr.refresh()
+            stdscr.noutrefresh()
+            curses.doupdate()
 
             # avanzamento automatico a fine brano
             if track.is_song_over():
@@ -731,6 +1145,9 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
 
             if key == -1:
                 continue
+            elif key == curses.KEY_RESIZE:
+                render_cache.clear()
+                stdscr.erase()
             elif key in (ord("q"), ord("Q")):
                 break
             elif key == ord(" "):
@@ -776,12 +1193,41 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
             elif key == ord("<"):
                 track.change_speed(-SPEED_STEP)
                 status_msg = f"Velocita': {track.speed:.2f}x"
+            elif key == ord("]"):
+                track.change_transpose(TRANSPOSE_STEP)
+                status_msg = f"Trasposizione: {track.transpose:+d} semitoni"
+            elif key == ord("["):
+                track.change_transpose(-TRANSPOSE_STEP)
+                status_msg = f"Trasposizione: {track.transpose:+d} semitoni"
             elif key in (ord("l"), ord("L")):
                 mode = playlist.cycle_loop_mode()
                 status_msg = f"Modalita' ripetizione: {LOOP_LABELS[mode]}"
             elif key in (ord("s"), ord("S")):
                 enabled = playlist.toggle_shuffle()
                 status_msg = "Shuffle attivato" if enabled else "Shuffle disattivato"
+            elif key in (ord("p"), ord("P")):
+                raw = curses_prompt(stdscr, "Canale Programma (es. 1 41): ")
+                render_cache.clear()
+                stdscr.erase()
+                try:
+                    ch_str, prog_str = raw.split()
+                    channel = int(ch_str) - 1
+                    program = int(prog_str)
+                    if 0 <= channel <= 15 and 0 <= program <= 127:
+                        track.set_program(channel, program)
+                        status_msg = f"Canale {channel + 1}: programma {program}"
+                    else:
+                        status_msg = "Valori fuori range (canale 1-16, programma 0-127)"
+                except Exception:
+                    status_msg = "Formato non valido: usa 'canale programma', es. '1 41'"
+            elif key == curses.KEY_F7:
+                new_sf = curses_prompt(stdscr, "Nuovo SoundFont (.sf2): ")
+                render_cache.clear()
+                stdscr.erase()
+                if new_sf and track.change_soundfont(new_sf):
+                    status_msg = f"SoundFont caricato: {os.path.basename(new_sf)}"
+                elif new_sf:
+                    status_msg = "Impossibile caricare il SoundFont indicato"
             elif ord("0") <= key <= ord("9"):
                 # tasti 1-9 -> canali MIDI 1-9 (indici 0-8), tasto 0 -> canale 10 (indice 9)
                 digit = key - ord("0")
@@ -798,6 +1244,59 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist, logfile,
                 status_msg = f"Canale {channel + 1}: {'mutato' if muted else 'riattivato'}"
     finally:
         track.stop_process()
+
+
+def export_to_wav(path, soundfont, out_path, gain=0.5, sample_rate=44100,
+                   no_effects=False, tail_seconds=2.0):
+    """Renderizza un file MIDI in un WAV offline: nessun driver audio viene
+    avviato, i campioni sono generati con get_samples() alla massima
+    velocità della CPU invece che in tempo reale.
+    """
+    info = analyze_midi(path)
+    events = info["events"]
+
+    synth = fluidsynth.Synth(gain=gain, samplerate=float(sample_rate))
+    with _suppress_native_output():
+        if no_effects:
+            synth.setting("synth.reverb.active", 0)
+            synth.setting("synth.chorus.active", 0)
+        sfid = synth.sfload(soundfont)
+    for ch in range(16):
+        synth.program_select(ch, sfid, 0, 0)
+
+    wav = wave.open(out_path, "wb")
+    wav.setnchannels(2)
+    wav.setsampwidth(2)  # 16 bit
+    wav.setframerate(sample_rate)
+
+    try:
+        current_sample = 0
+        for t, msg in events:
+            target_sample = int(t * sample_rate)
+            n = target_sample - current_sample
+            if n > 0:
+                samples = synth.get_samples(n)
+                wav.writeframesraw(samples.tobytes())
+                current_sample = target_sample
+
+            ch = msg.channel
+            if msg.type == "note_on" and msg.velocity > 0:
+                synth.noteon(ch, msg.note, msg.velocity)
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                synth.noteoff(ch, msg.note)
+            elif msg.type == "control_change":
+                synth.cc(ch, msg.control, msg.value)
+            elif msg.type == "program_change":
+                synth.program_change(ch, msg.program)
+            elif msg.type == "pitchwheel":
+                synth.pitch_bend(ch, msg.pitch + 8192)
+
+        tail_samples = int(tail_seconds * sample_rate)
+        if tail_samples > 0:
+            wav.writeframesraw(synth.get_samples(tail_samples).tobytes())
+    finally:
+        wav.close()
+        synth.delete()
 
 
 def main():
@@ -822,11 +1321,11 @@ def main():
     parser.add_argument("--shuffle", action="store_true", help="Avvia la playlist in modalità casuale")
     parser.add_argument("--loop", choices=["off", "all", "single"], default="off",
                          help="Modalità di ripetizione iniziale (default: off)")
+    parser.add_argument("--export", metavar="OUTPUT",
+                         help="Non avvia l'interfaccia: renderizza i file MIDI in WAV (rendering "
+                              "offline, più veloce del tempo reale). Con un solo file, OUTPUT è il "
+                              "percorso del .wav; con più file, OUTPUT è una cartella di destinazione.")
     args = parser.parse_args()
-
-    if shutil.which("fluidsynth") is None:
-        print("Errore: 'fluidsynth' non trovato nel PATH. Installalo prima di continuare.")
-        sys.exit(1)
 
     cfg = load_config()
 
@@ -873,18 +1372,43 @@ def main():
         cfg["midi_path"] = midi_input
     save_config(cfg)
 
+    if args.export:
+        sample_rate = args.sample_rate or 44100
+        if len(files) == 1:
+            targets = [(files[0], args.export)]
+        else:
+            os.makedirs(args.export, exist_ok=True)
+            targets = [
+                (f, os.path.join(args.export, os.path.splitext(os.path.basename(f))[0] + ".wav"))
+                for f in files
+            ]
+        for src, dst in targets:
+            print(f"Rendering '{src}' -> '{dst}' ...")
+            try:
+                export_to_wav(src, soundfont, dst, gain=args.gain,
+                               sample_rate=sample_rate, no_effects=args.no_effects)
+            except Exception as e:
+                print(f"  Errore durante l'esportazione: {e}")
+        return
+
     playlist = Playlist(files)
     playlist.shuffle = args.shuffle
     playlist.loop_mode = args.loop
-    logpath = "/tmp/midiplayer_fluidsynth.log"
 
-    with open(logpath, "w") as logfile:
+    # Non solo all'avvio: durante la riproduzione FluidSynth può scrivere
+    # avvisi direttamente sul file descriptor dello stderr di sistema (es.
+    # "Instrument not found on channel N ... substituted ..." quando un
+    # program change punta a un preset assente nel SoundFont). Scrivendo a
+    # basso livello, questi messaggi bypassano completamente curses e
+    # spostano/rovinano l'intera interfaccia. Copriamo perciò tutta la
+    # sessione curses, non solo il caricamento del SoundFont.
+    with _suppress_native_output():
         curses.wrapper(
-            run_ui, soundfont, args.audio_driver, args.gain, playlist, logfile,
+            run_ui, soundfont, args.audio_driver, args.gain, playlist,
             args.period_size, args.periods, args.sample_rate, args.no_effects,
         )
 
-    print(f"Riproduzione terminata. Log di fluidsynth salvato in: {logpath}")
+    print("Riproduzione terminata.")
 
 
 if __name__ == "__main__":
