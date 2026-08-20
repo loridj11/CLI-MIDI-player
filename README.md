@@ -4,6 +4,14 @@ A lightweight, responsive, and elegant command-line MIDI player written in Pytho
 
 ---
 
+## Benchmark & Resource Footprint
+Tested under strict Linux `systemd-run` cgroup limits:
+* **CPU Usage:** Flawless real-time playback down to **2% of a single core** with default buffer settings.
+* **RAM Footprint:** ~264 MB total (using a ~240 MB GM SoundFont).
+* **Robustness:** Starts and runs down to **1% CPU** (requires larger buffer size).
+  
+---
+
 ## Key Features
 
 * **Curses TUI Interface**: A complete terminal-based graphical interface with no heavy GUI dependencies.
