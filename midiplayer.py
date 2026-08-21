@@ -44,7 +44,7 @@ Comandi da tastiera:
     N           Salta al brano successivo
     B           Torna al brano precedente
     R           Torna all'inizio del brano corrente
-    SU / GIU    Naviga la playlist (selezione)
+    SU / GIU    Naviga la playlist (selezione, con scorrimento automatico)
     INVIO       Riproduce il brano selezionato nella playlist
     + / -       Alza / abbassa il volume (PagSu/PagGiu equivalenti)
     < / >       Rallenta / velocizza la riproduzione
@@ -57,13 +57,18 @@ Comandi da tastiera:
     F7          Cambia SoundFont a caldo (chiede il percorso del nuovo .sf2)
     P           Cambia lo strumento (Program Change) di un canale
                 (chiede "canale programma", es. "1 41" = canale 1, programma 41)
+    ? / H       Mostra/nasconde la legenda comandi (nascosta di default, per
+                lasciare più spazio verticale a piano roll e playlist)
     Q           Esci
 
-Durante la riproduzione vengono mostrate anche le note attualmente in
-esecuzione (canale percussioni escluso), l'accordo riconosciuto (con
-eventuale rivolto, es. "Do maj / Mi"), una mini piano-roll ASCII con le
-note in arrivo, il titolo e l'autore/copyright letti dai metadati del
-file e, quando presenti, i testi (lyrics) sincronizzati come in un karaoke.
+Durante la riproduzione vengono mostrati anche il nome del file, il BPM e la
+tonalità correnti, le note attualmente in esecuzione (canale percussioni
+escluso), l'accordo riconosciuto (con eventuale rivolto, es. "Do maj / Mi"),
+una piano-roll ASCII a blocchi con le note in arrivo colorate per canale
+MIDI, il titolo e l'autore/copyright letti dai metadati del file e, quando
+presenti, i testi (lyrics) sincronizzati come in un karaoke. Se il terminale
+supporta i colori, barra di avanzamento/stato sono verdi/ciano e l'accordo
+rilevato è in giallo per risaltare a colpo d'occhio.
 
 Se l'audio gracchia/distorce:
     - aumenta il buffer: --period-size 2048 --periods 6 (o valori più alti)
@@ -81,6 +86,7 @@ import curses
 import json
 import os
 import random
+import re
 import shlex
 import sys
 import threading
@@ -245,6 +251,27 @@ FLAT_ROOT_SPELLING = {1: "Reb", 3: "Mib", 8: "Lab", 10: "Sib"}
 
 def spell_root(pitch_class):
     return FLAT_ROOT_SPELLING.get(pitch_class, NOTE_NAMES[pitch_class])
+
+
+# mido esprime la tonalità (meta-evento "key_signature") con la notazione
+# anglosassone, es. "C", "F#", "Bbm": lettera base + eventuale alterazione +
+# eventuale "m" finale per il modo minore.
+KEY_LETTER_TO_ITALIAN = {"C": "Do", "D": "Re", "E": "Mi", "F": "Fa", "G": "Sol", "A": "La", "B": "Si"}
+KEY_SIGNATURE_RE = re.compile(r"^([A-G])([#b]?)(m?)$")
+
+
+def format_key_signature(key):
+    """Converte una tonalità in notazione anglosassone (es. 'Bbm') nel
+    formato italiano usato nel resto del player (es. 'Sib min')."""
+    if not key:
+        return None
+    match = KEY_SIGNATURE_RE.match(key)
+    if not match:
+        return key  # formato inatteso: meglio mostrare il valore grezzo che nulla
+    letter, accidental, minor = match.groups()
+    name = KEY_LETTER_TO_ITALIAN.get(letter, letter) + accidental
+    name += " min" if minor else " magg"
+    return name
 
 
 def sanitize_text(text):
@@ -413,10 +440,13 @@ def analyze_midi(path):
         title           titolo del brano (dal primo evento 'track_name' utile), o None
         author          autore/copyright (dal primo evento 'copyright'), o None
         lyrics          lista ordinata di (tempo_secondi, testo) per la modalità karaoke
+        tempo_events    lista ordinata di (tempo_secondi, bpm) per ogni cambio di tempo
+        key_signature   tonalità dichiarata nel file (es. "Do magg", "Re min"), o None
     """
     empty = {
         "duration": 0.0, "note_events": [], "events": [],
         "title": None, "author": None, "lyrics": [],
+        "tempo_events": [], "key_signature": None,
     }
     try:
         mid = mido.MidiFile(path)
@@ -427,10 +457,12 @@ def analyze_midi(path):
 
     title = None
     author = None
+    key_signature = None
     note_events = []
     events = []
     lyric_events = []   # eventi 'lyrics' veri e propri (karaoke standard)
     text_events = []    # eventi 'text' generici, usati come ripiego
+    tempo_events = []   # (tempo_secondi, bpm)
     elapsed = 0.0
     try:
         # iterare su "mid" (non su mid.tracks) fonde le tracce, applica i
@@ -462,6 +494,11 @@ def analyze_midi(path):
                 text = sanitize_text(msg.text)
                 if text:
                     text_events.append((elapsed, text))
+            elif msg.type == "set_tempo":
+                bpm = round(60000000 / msg.tempo) if msg.tempo else 120
+                tempo_events.append((elapsed, bpm))
+            elif msg.type == "key_signature" and key_signature is None:
+                key_signature = format_key_signature(msg.key)
     except Exception:
         note_events = []
         events = []
@@ -474,6 +511,7 @@ def analyze_midi(path):
     return {
         "duration": duration, "note_events": note_events, "events": events,
         "title": title, "author": author, "lyrics": lyrics,
+        "tempo_events": tempo_events, "key_signature": key_signature,
     }
 
 
@@ -522,6 +560,9 @@ class FluidSynthTrack:
         self.title = None
         self.author = None
         self.lyrics = []
+        self.tempo_events = []    # (tempo_secondi, bpm)
+        self._tempo_times = []
+        self.key_signature = None
 
         self.paused = False
         self.finished = False
@@ -551,13 +592,18 @@ class FluidSynthTrack:
         self.events = info["events"]
         self._event_times = [t for t, _ in self.events]
         self._note_ons = [
-            (t, note) for t, kind, ch, note in self.note_events
+            (t, note, ch) for t, kind, ch, note in self.note_events
             if kind == "on" and ch != PERCUSSION_CHANNEL
         ]
-        self._note_on_times = [t for t, _ in self._note_ons]
+        self._note_on_times = [t for t, _, _ in self._note_ons]
+        self._pitch_events = [(t, msg.channel) for t, msg in self.events if msg.type == "pitchwheel"]
+        self._pitch_event_times = [t for t, _ in self._pitch_events]
         self.title = info["title"]
         self.author = info["author"]
         self.lyrics = info["lyrics"]
+        self.tempo_events = info["tempo_events"]
+        self._tempo_times = [t for t, _ in self.tempo_events]
+        self.key_signature = info["key_signature"]
 
         self.paused = False
         self.finished = False
@@ -785,6 +831,17 @@ class FluidSynthTrack:
                 active.pop(key, None)
         return sorted(active.keys(), key=lambda ck: ck[1])
 
+    # ---- tempo (BPM) --------------------------------------------------------------
+    def current_bpm(self):
+        """BPM in vigore all'istante corrente, seguendo eventuali cambi di
+        tempo nel brano (non solo quello iniziale)."""
+        if not self.tempo_events:
+            return 120  # tempo di default quando il file non dichiara nulla
+        idx = bisect.bisect_right(self._tempo_times, self.elapsed()) - 1
+        if idx < 0:
+            return self.tempo_events[0][1]
+        return self.tempo_events[idx][1]
+
     # ---- lyrics / karaoke --------------------------------------------------------
     def current_lyric(self):
         """Ritorna l'ultima riga di testo con timestamp <= istante corrente, se presente."""
@@ -800,11 +857,32 @@ class FluidSynthTrack:
 
     # ---- mute/solo dei canali (modalità esercizio) --------------------------------
     def toggle_channel_mute(self, channel):
+        """Silenzia/riattiva un canale agendo SOLO sul volume (CC7), senza
+        passare da _reposition()/_resync_state(): quella strada faceva un
+        system_reset() e ri-attaccava (retrigger) tutte le note attive in
+        quell'istante, causando un fastidioso "click"/nota ripetuta ad ogni
+        mute o smute. Così invece le note eventualmente già suonanti restano
+        esattamente dove sono, semplicemente udibili o no.
+        """
         if channel in self.muted_channels:
             self.muted_channels.discard(channel)
+            self.synth.cc(channel, 7, self._channel_volume_at(channel, self.elapsed()))
         else:
             self.muted_channels.add(channel)
-        self._reposition(self.elapsed())
+            self.synth.cc(channel, 7, 0)
+
+    def _channel_volume_at(self, channel, target_time):
+        """Ultimo valore di CC7 (volume canale) impostato dal file per
+        'channel' fino a target_time, o 100 (default MIDI) se il file non lo
+        specifica mai: serve per sapere a quale volume tornare quando si
+        smuta un canale, senza dover rigiocare l'intero stato del synth.
+        """
+        end_idx = bisect.bisect_right(self._event_times, target_time)
+        volume = 100
+        for t, msg in self.events[:end_idx]:
+            if msg.type == "control_change" and msg.channel == channel and msg.control == 7:
+                volume = msg.value
+        return volume
 
     # ---- SoundFont e strumenti ---------------------------------------------------
     def change_soundfont(self, path):
@@ -890,14 +968,74 @@ class Playlist:
 
 LOOP_LABELS = {"off": "Off", "all": "Tutti", "single": "Singolo"}
 
+# --- colori --------------------------------------------------------------------
+# Numeri di color pair curses (inizializzati in init_colors(), chiamata una
+# sola volta all'avvio della UI): definiti qui come costanti così il resto
+# del codice li referenzia per nome invece che per numero magico.
+COLOR_PAIR_PROGRESS = 1   # barra di avanzamento e stato di riproduzione (verde/cyan)
+COLOR_PAIR_CHORD = 2      # accordo rilevato in tempo reale (giallo/arancione)
+COLOR_PAIR_ACTIVE_TRACK = 3  # icona ▶ della traccia in riproduzione nella playlist
+COLOR_PAIR_BEND = 4       # nota con pitch bend attivo nella piano roll (si distingue dal colore di canale)
+
+# Piano roll: una tavolozza di colori ciclica assegnata per canale MIDI, così
+# note di canali diversi (tipicamente melodia/basso/accompagnamento) si
+# distinguono a colpo d'occhio. I numeri di pair usati sono 10, 11, 12, ...
+PIANO_ROLL_CHANNEL_PAIR_BASE = 10
+PIANO_ROLL_CHANNEL_COLORS = [
+    curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
+    curses.COLOR_BLUE, curses.COLOR_YELLOW, curses.COLOR_WHITE,
+]
+
+
+def init_colors():
+    """Inizializza i color pair curses, se il terminale li supporta.
+    Ritorna True/False: tutto il resto del codice deve continuare a
+    funzionare anche senza colori (terminali monocromatici), quindi ogni
+    punto che li usa controlla questo valore prima di applicare un colore.
+    """
+    if not curses.has_colors():
+        return False
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1  # sfondo trasparente/quello di default del terminale
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    try:
+        curses.init_pair(COLOR_PAIR_PROGRESS, curses.COLOR_CYAN, bg)
+        curses.init_pair(COLOR_PAIR_CHORD, curses.COLOR_YELLOW, bg)
+        curses.init_pair(COLOR_PAIR_ACTIVE_TRACK, curses.COLOR_GREEN, bg)
+        curses.init_pair(COLOR_PAIR_BEND, curses.COLOR_RED, bg)
+        for i, color in enumerate(PIANO_ROLL_CHANNEL_COLORS):
+            curses.init_pair(PIANO_ROLL_CHANNEL_PAIR_BASE + i, color, bg)
+    except curses.error:
+        return False
+    return True
+
+
+def channel_color_pair(channel):
+    """Numero di color pair assegnato a un canale MIDI nella piano roll."""
+    return PIANO_ROLL_CHANNEL_PAIR_BASE + (channel % len(PIANO_ROLL_CHANNEL_COLORS))
+
+
+# Blocchi Unicode a ottavi, dal vuoto al pieno: permettono una barra di
+# avanzamento "morbida" invece di scattare di una cella intera per volta.
+PROGRESS_BLOCK_LEVELS = " ▏▎▍▌▋▊▉█"
+
 
 def draw_progress_bar(width, fraction):
     fraction = max(0.0, min(1.0, fraction))
-    filled = int(width * fraction)
-    return "#" * filled + "-" * (width - filled)
+    eighths_total = round(fraction * width * 8)
+    full_cells, remainder = divmod(eighths_total, 8)
+    full_cells = min(full_cells, width)
+    bar = PROGRESS_BLOCK_LEVELS[-1] * full_cells
+    if full_cells < width:
+        bar += PROGRESS_BLOCK_LEVELS[remainder]
+        bar += " " * (width - full_cells - 1)
+    return bar
 
 
-def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None):
+def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None, clear_to_eol=True):
     """Disegna una riga solo se il contenuto (testo+attributo+colonna) è
     cambiato rispetto al frame precedente. Evita l'erase()+redraw completo
     ad ogni ciclo (150ms), che genera flickering e consuma CPU inutilmente:
@@ -905,7 +1043,16 @@ def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None):
 
     'key' identifica la voce nella cache: di default è il numero di riga,
     utile quando più chiamate concorrono sullo stesso numero di riga fisica
-    (qui non serve più per la piano roll, ma resta comodo in generale).
+    (es. le singole celle della piano roll, disegnate una per lane).
+
+    'clear_to_eol' va disattivato (False) quando più chiamate indipendenti
+    disegnano segmenti diversi sulla STESSA riga fisica (piano roll: una
+    chiamata per ogni lane/nota): altrimenti clrtoeol() cancellerebbe anche
+    le celle già disegnate a destra in un frame precedente e non ridisegnate
+    in questo (perché il loro contenuto non è cambiato ed è stato quindi
+    filtrato dalla cache) - il sintomo è proprio quello di celle/etichette
+    già "accese" che spariscono non appena una cella alla loro sinistra
+    cambia.
     """
     cache_key = row if key is None else key
     entry = (col, text, attr)
@@ -913,7 +1060,8 @@ def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None):
         return
     try:
         stdscr.move(row, col)
-        stdscr.clrtoeol()
+        if clear_to_eol:
+            stdscr.clrtoeol()
         stdscr.addstr(row, col, text, attr)
     except curses.error:
         pass
@@ -922,15 +1070,35 @@ def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None):
 
 PITCH_CLASS_LABELS = ["Do", "D#", "Re", "R#", "Mi", "Fa", "F#", "So", "S#", "La", "L#", "Si"]
 
+# Caratteri della piano roll: blocchi Unicode pieni invece di simboli ASCII
+# rarefatti, per un colpo d'occhio più netto; un simbolo diverso segnala un
+# pitch bend in corso su quella nota, per distinguerlo da un semplice attacco.
+PIANO_ROLL_SOUND_CHAR = "█"     # nota che sta suonando davvero, adesso
+PIANO_ROLL_UPCOMING_CHAR = "▌"  # nota in arrivo nei prossimi istanti
+PIANO_ROLL_BEND_CHAR = "≈"      # nota che sta suonando E ha un pitch bend attivo
+PIANO_ROLL_BEND_WINDOW = 0.15   # secondi entro cui un pitchwheel è considerato "in corso"
 
-def render_piano_roll(stdscr, cache, track, row0, col0, width):
+
+def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     """Disegna una mini piano-roll ASCII a colonne fisse: ogni colonna
     rappresenta sempre la stessa nota (non si sposta seguendo cosa sta
     suonando in quel momento, altrimenti sarebbe impossibile seguirla a
     colpo d'occhio) e in basso è etichettata con il nome della nota
-    ("Do", "D#", "Re", ...). Il pallino 'o' scende riga dopo riga man mano
+    ("Do", "D#", "Re", ...). Il blocco '▌' scende riga dopo riga man mano
     che il momento in cui la nota suona si avvicina; quando la nota suona
-    davvero, sull'ultima riga (in grassetto) appare '#'.
+    davvero, sull'ultima riga appare '█' (o '≈', in un colore dedicato, se in
+    quell'istante il canale ha anche un pitch bend attivo). Ogni nota è
+    colorata in base al canale MIDI di provenienza (tipicamente melodia/
+    basso/accompagnamento sono su canali diversi), se il terminale supporta
+    i colori. L'etichetta della nota in basso si illumina con lo stesso
+    colore quando la nota sta suonando in quell'istante, per seguire
+    l'animazione a colpo d'occhio.
+
+    Le righe "in arrivo" partizionano l'intero intervallo di anticipo
+    (PIANO_ROLL_LOOKAHEAD secondi) in fasce di tempo CONTIGUE, una per riga,
+    senza spazi vuoti tra una fascia e l'altra: un evento di nota ricade
+    sempre in esattamente una fascia/riga, non può "cadere in un buco" tra
+    due finestre e sparire per un istante prima di suonare davvero.
 
     L'intervallo mostrato è sempre lo stesso per ogni brano: va dall'ottava
     PIANO_ROLL_START_OCTAVE per PIANO_ROLL_NUM_OCTAVES ottave (per default
@@ -954,30 +1122,78 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width):
     lo = bisect.bisect_left(track._note_on_times, t_now)
     hi = bisect.bisect_right(track._note_on_times, t_now + PIANO_ROLL_LOOKAHEAD)
     upcoming = track._note_ons[lo:hi]
-    active_now = {n for _, n in track.active_notes()}
+    active_now = track.active_notes()  # lista di (canale, nota)
+    active_by_note = {note: ch for ch, note in active_now}
+
+    # canali con un pitch bend "in corso" adesso, per il simbolo/colore speciale
+    plo = bisect.bisect_left(track._pitch_event_times, t_now - PIANO_ROLL_BEND_WINDOW)
+    phi = bisect.bisect_right(track._pitch_event_times, t_now + PIANO_ROLL_BEND_WINDOW)
+    bending_channels = {ch for _, ch in track._pitch_events[plo:phi]}
+
+    # Righe disponibili per le note "in arrivo" (tutte tranne l'ultima, che è
+    # "ora"): l'intervallo [0, PIANO_ROLL_LOOKAHEAD) viene diviso in altrettante
+    # fasce di uguale durata. Per ogni nota calcoliamo la riga in cui si trova
+    # in questo istante (0 = in alto/più lontana, upcoming_rows-1 = subito
+    # prima di suonare) e disegniamo una barra CONTINUA dalla riga 0 fino a
+    # quella riga inclusa: man mano che la nota si avvicina la riga cresce e
+    # la barra si allunga verso il basso, invece di un singolo punto isolato
+    # che salta da una riga alla successiva (e che, tra l'altro, dava anche
+    # l'impressione sbagliata che le note "sparissero" invaso da altre celle).
+    # Se più occorrenze della stessa nota cadono nella finestra di anticipo,
+    # si tiene la più vicina (riga più bassa): la sua barra 0..riga copre
+    # comunque per unione anche quella delle occorrenze più lontane.
+    upcoming_rows = PIANO_ROLL_ROWS - 1
+    bin_width = PIANO_ROLL_LOOKAHEAD / upcoming_rows
+    note_fill_row = {}  # nota -> (riga più bassa raggiunta, canale di quell'occorrenza)
+    for t, note, ch in upcoming:
+        remaining = max(0.0, t - t_now)
+        bin_idx = min(int(remaining / bin_width), upcoming_rows - 1)
+        row_idx = upcoming_rows - 1 - bin_idx  # più lontana nel tempo = più in alto (riga 0)
+        prev = note_fill_row.get(note)
+        if prev is None or row_idx > prev[0]:
+            note_fill_row[note] = (row_idx, ch)
 
     for r in range(PIANO_ROLL_ROWS):
         is_now_row = r == PIANO_ROLL_ROWS - 1
-        delta = PIANO_ROLL_LOOKAHEAD * (PIANO_ROLL_ROWS - 1 - r) / max(1, PIANO_ROLL_ROWS - 1)
-        slice_t = t_now + delta
-        chars = []
-        for note in range(low_note, low_note + lanes):
-            if is_now_row and note in active_now:
-                symbol = "#"
-            elif not is_now_row and any(
-                n == note and abs(t - slice_t) <= PIANO_ROLL_LOOKAHEAD / (2 * PIANO_ROLL_ROWS)
-                for t, n in upcoming
-            ):
-                symbol = "o"
+        row = row0 + 1 + r
+        for lane, note in enumerate(range(low_note, low_note + lanes)):
+            col = col0 + lane * lane_width
+            symbol = None
+            channel = None
+            is_bending = False
+            if is_now_row and note in active_by_note:
+                channel = active_by_note[note]
+                is_bending = channel in bending_channels
+                symbol = PIANO_ROLL_BEND_CHAR if is_bending else PIANO_ROLL_SOUND_CHAR
+            elif not is_now_row and note in note_fill_row and r <= note_fill_row[note][0]:
+                symbol, channel = PIANO_ROLL_UPCOMING_CHAR, note_fill_row[note][1]
+            if symbol is None:
+                cell = " " * lane_width  # colonna vuota: niente puntini quando non c'è nulla in arrivo
+                attr = curses.A_NORMAL
             else:
-                symbol = " "  # colonna vuota: niente puntini quando non c'è nulla in arrivo
-            chars.append(symbol.ljust(lane_width))  # il resto della colonna resta spazio, per distanziare
-        line = "".join(chars)[:width]
-        draw_line(stdscr, cache, row0 + 1 + r, col0, line,
-                  curses.A_BOLD if is_now_row else curses.A_NORMAL, key=("pianoroll_row", r))
+                cell = symbol.ljust(lane_width)
+                attr = curses.A_BOLD if is_now_row else curses.A_NORMAL
+                if colors_enabled:
+                    pair = COLOR_PAIR_BEND if is_bending else channel_color_pair(channel)
+                    attr |= curses.color_pair(pair)
+            draw_line(stdscr, cache, row, col, cell, attr, key=("pianoroll_cell", r, lane), clear_to_eol=False)
 
-    labels = "".join(PITCH_CLASS_LABELS[note % 12].ljust(lane_width) for note in range(low_note, low_note + lanes))
-    draw_line(stdscr, cache, row0 + 1 + PIANO_ROLL_ROWS, col0, labels[:width], curses.A_DIM, key="pianoroll_labels")
+    labels_row = row0 + 1 + PIANO_ROLL_ROWS
+    for lane, note in enumerate(range(low_note, low_note + lanes)):
+        col = col0 + lane * lane_width
+        label = PITCH_CLASS_LABELS[note % 12].ljust(lane_width)
+        if note in active_by_note:
+            # la nota sta suonando adesso: l'etichetta si illumina con lo
+            # stesso colore/intensità della cella nella riga "ora" sopra,
+            # per seguire a colpo d'occhio l'animazione della piano roll
+            channel = active_by_note[note]
+            attr = curses.A_BOLD
+            if colors_enabled:
+                pair = COLOR_PAIR_BEND if channel in bending_channels else channel_color_pair(channel)
+                attr |= curses.color_pair(pair)
+        else:
+            attr = curses.A_DIM
+        draw_line(stdscr, cache, labels_row, col, label, attr, key=("pianoroll_label", lane), clear_to_eol=False)
 
 
 def curses_prompt(stdscr, message):
@@ -1009,6 +1225,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)  # ms, controlla anche il refresh della UI
+    colors_enabled = init_colors()
 
     track = FluidSynthTrack(soundfont, audio_driver, gain,
                              period_size=period_size, periods=periods,
@@ -1018,6 +1235,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     status_msg = ""
     render_cache = {}
     prev_size = stdscr.getmaxyx()
+    show_help = False  # la legenda comandi compare solo premendo ?/H, per lasciare più spazio verticale
 
     def load_index(i):
         playlist.index = i
@@ -1038,8 +1256,14 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             draw_line(stdscr, render_cache, 0, max(0, (w - len(title_bar)) // 2), title_bar, curses.A_BOLD)
 
             row = 2
-            display_title = track.title or os.path.basename(playlist.current)
-            draw_line(stdscr, render_cache, row, 2, f"In riproduzione: {display_title}"[: w - 4])
+            # Nome file (senza estensione) invece del titolo nei metadati: è
+            # quasi sempre più affidabile/riconoscibile dei metadati interni,
+            # spesso assenti o generici in molti file MIDI reali.
+            file_stem = os.path.splitext(os.path.basename(playlist.current))[0]
+            bpm_str = f"{track.current_bpm()} BPM"
+            key_str = track.key_signature or "-"
+            draw_line(stdscr, render_cache, row, 2,
+                      f"In riproduzione: {file_stem}  |  {bpm_str}  |  Tonalita': {key_str}"[: w - 4])
             row += 1
             draw_line(stdscr, render_cache, row, 2,
                       (f"Autore/copyright: {track.author}" if track.author else "")[: w - 4])
@@ -1049,12 +1273,13 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             total = track.duration
             bar_width = max(10, w - 20)
             bar = draw_progress_bar(bar_width, elapsed / total if total else 0)
+            progress_attr = curses.color_pair(COLOR_PAIR_PROGRESS) if colors_enabled else curses.A_NORMAL
             draw_line(stdscr, render_cache, row, 2,
-                      f"{format_time(elapsed)} [{bar}] {format_time(total)}"[: w - 2])
+                      f"{format_time(elapsed)} [{bar}] {format_time(total)}"[: w - 2], progress_attr)
             row += 2
 
             state = "PAUSA" if track.paused else "PLAY"
-            draw_line(stdscr, render_cache, row, 2, f"Stato: {state}")
+            draw_line(stdscr, render_cache, row, 2, f"Stato: {state}", progress_attr)
             row += 1
 
             info_line = (f"Volume: {track.gain:.2f}  Velocita': {track.speed:.2f}x  "
@@ -1082,7 +1307,8 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
 
             chord = guess_chord(note for _, note in active) if len(active) >= 2 else None
             chord_line = f"Accordo: {chord}" if chord else "Accordo: -"
-            draw_line(stdscr, render_cache, row, 2, chord_line[: w - 4])
+            chord_attr = (curses.color_pair(COLOR_PAIR_CHORD) | curses.A_BOLD) if (colors_enabled and chord) else curses.A_NORMAL
+            draw_line(stdscr, render_cache, row, 2, chord_line[: w - 4], chord_attr)
             row += 1
 
             lyric = track.current_lyric() or ""
@@ -1096,31 +1322,59 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 draw_line(stdscr, render_cache, row, 2, (f"> {lyric}" if lyric else "")[: w - 4], curses.A_BOLD)
             row += 2
 
-            render_piano_roll(stdscr, render_cache, track, row, 2, w - 2)
+            render_piano_roll(stdscr, render_cache, track, row, 2, w - 2, colors_enabled)
             row += PIANO_ROLL_ROWS + 3  # header + righe + etichette note + una riga di spaziatura
 
-            draw_line(stdscr, render_cache, row, 2, "Playlist:", curses.A_UNDERLINE)
+            playlist_total = len(playlist.files)
+            list_start_row = row + 1
+            help_rows = 3 if show_help else 1  # righe riservate in fondo (vedi sotto)
+            max_list_rows = max(1, h - list_start_row - help_rows - 1)
+
+            # scorrimento: la finestra visibile segue la voce selezionata,
+            # tenendola centrata quando la playlist non ci sta tutta a schermo
+            if playlist_total <= max_list_rows:
+                scroll_offset = 0
+            else:
+                scroll_offset = playlist.selected - max_list_rows // 2
+                scroll_offset = max(0, min(scroll_offset, playlist_total - max_list_rows))
+
+            header = "Playlist:"
+            if playlist_total > max_list_rows:
+                shown_first = scroll_offset + 1
+                shown_last = min(scroll_offset + max_list_rows, playlist_total)
+                header += f"  ({shown_first}-{shown_last}/{playlist_total})"
+            draw_line(stdscr, render_cache, row, 2, header, curses.A_UNDERLINE)
             row += 1
-            list_start_row = row
-            max_list_rows = max(1, h - list_start_row - 7)
-            for r, i in enumerate(range(len(playlist.files))):
-                if r >= max_list_rows:
-                    break
+
+            visible_indices = range(scroll_offset, min(scroll_offset + max_list_rows, playlist_total))
+            for r, i in enumerate(visible_indices):
                 fname = os.path.basename(playlist.files[i])
-                marker = ">" if i == playlist.index else " "
-                attr = curses.A_REVERSE if i == playlist.selected else curses.A_NORMAL
+                is_playing = i == playlist.index
+                is_selected = i == playlist.selected
+                marker = "\u25b6" if is_playing else " "  # ▶
+                attr = curses.A_NORMAL
+                if colors_enabled and is_playing:
+                    attr |= curses.color_pair(COLOR_PAIR_ACTIVE_TRACK) | curses.A_BOLD
+                if is_selected:
+                    attr |= curses.A_REVERSE
                 line = f"{marker} {fname}"[: w - 4]
                 draw_line(stdscr, render_cache, list_start_row + r, 4, line, attr)
+            # ripulisce eventuali righe rimaste da una playlist scorsa più lunga
+            # (es. dopo un ridimensionamento) che non vengono più riscritte qui sopra
+            for r in range(len(visible_indices), max_list_rows):
+                draw_line(stdscr, render_cache, list_start_row + r, 4, "")
 
-            help1 = "SPAZIO pausa | <- -> avanti/indietro 5s | N succ. | B prec. | R riavvia"
-            help2 = "SU/GIU seleziona | INVIO riproduci | L loop | S shuffle"
-            help3 = "+/- volume | </> velocita' | ]/[ trasposizione | P programma canale"
-            help4 = "1-9,0 muta canale | F1-F6 canali 11-16 | F7 SoundFont | Q esci"
-            if h > list_start_row + max_list_rows + 5:
-                draw_line(stdscr, render_cache, h - 5, 2, help1[: w - 4])
-                draw_line(stdscr, render_cache, h - 4, 2, help2[: w - 4])
-                draw_line(stdscr, render_cache, h - 3, 2, help3[: w - 4])
-                draw_line(stdscr, render_cache, h - 2, 2, help4[: w - 4])
+            if show_help:
+                help1 = ("SPAZIO pausa | <-/-> 5s | N/B brano | R riavvia | SU/GIU/INVIO playlist | "
+                         "L loop | S shuffle")
+                help2 = ("+/- volume | </> velocita' | [/] trasposizione | P programma | "
+                         "1-9,0/F1-F6 muta canale | F7 SoundFont")
+                help3 = "?/H nascondi comandi | Q esci"
+                draw_line(stdscr, render_cache, h - 4, 2, help1[: w - 4])
+                draw_line(stdscr, render_cache, h - 3, 2, help2[: w - 4])
+                draw_line(stdscr, render_cache, h - 2, 2, help3[: w - 4])
+            else:
+                draw_line(stdscr, render_cache, h - 2, 2, "Premi ?/H per i comandi | Q per uscire"[: w - 4])
             draw_line(stdscr, render_cache, h - 1, 2, status_msg[: w - 4])
 
             stdscr.noutrefresh()
@@ -1205,6 +1459,10 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             elif key in (ord("s"), ord("S")):
                 enabled = playlist.toggle_shuffle()
                 status_msg = "Shuffle attivato" if enabled else "Shuffle disattivato"
+            elif key in (ord("?"), ord("h"), ord("H")):
+                show_help = not show_help
+                render_cache.clear()
+                stdscr.erase()
             elif key in (ord("p"), ord("P")):
                 raw = curses_prompt(stdscr, "Canale Programma (es. 1 41): ")
                 render_cache.clear()
