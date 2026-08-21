@@ -432,8 +432,11 @@ def analyze_midi(path):
 
     Ritorna un dizionario con:
         duration        durata totale in secondi
-        note_events     lista ordinata di (tempo_secondi, 'on'/'off', canale, nota)
-                         usata dalla UI per note attive/accordi/piano roll
+        note_events     lista ordinata di (tempo_secondi, 'on'/'off', canale, nota, tick_assoluto)
+                         usata dalla UI per note attive/accordi/piano roll; il tick
+                         assoluto (posizione grezza nel file, non convertita in
+                         secondi) serve alla piano roll per classificare la durata
+                         delle note molto brevi (1-2 tick, note "staccatissime")
         events          lista ordinata di (tempo_secondi, msg) con TUTTI i
                          messaggi "channel voice" (note, cc, program change,
                          pitch bend): è la sequenza che il player invia al synth
@@ -464,17 +467,26 @@ def analyze_midi(path):
     text_events = []    # eventi 'text' generici, usati come ripiego
     tempo_events = []   # (tempo_secondi, bpm)
     elapsed = 0.0
+    tick_elapsed = 0
     try:
-        # iterare su "mid" (non su mid.tracks) fonde le tracce, applica i
-        # cambi di tempo e converte msg.time in secondi: è lo stesso motivo
-        # per cui viene usato sia per l'analisi sia per pilotare il synth.
-        for msg in mid:
+        # Iteriamo in parallelo due viste della STESSA sequenza di messaggi:
+        # "mid" (via merge_tracks + conversione tempo-aware) dà il tempo in
+        # SECONDI, usato per la riproduzione e per tutta la UI; merge_tracks
+        # "grezzo" dà lo stesso identico messaggio, nello stesso ordine, ma
+        # con .time in TICK non convertiti. Le due sequenze sono garantite
+        # allineate 1:1 (mid.__iter__ è definito internamente proprio come
+        # merge_tracks + conversione, quindi rifarlo separatamente riproduce
+        # esattamente la stessa sequenza): zippandole otteniamo per ogni
+        # messaggio sia l'istante in secondi sia la posizione assoluta in
+        # tick, senza dover leggere il file due volte in modo scollegato.
+        for raw_msg, msg in zip(mido.merge_tracks(mid.tracks), mid):
             elapsed += msg.time
+            tick_elapsed += raw_msg.time
             if msg.type == "note_on" and msg.velocity > 0:
-                note_events.append((elapsed, "on", msg.channel, msg.note))
+                note_events.append((elapsed, "on", msg.channel, msg.note, tick_elapsed))
                 events.append((elapsed, msg))
             elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-                note_events.append((elapsed, "off", msg.channel, msg.note))
+                note_events.append((elapsed, "off", msg.channel, msg.note, tick_elapsed))
                 events.append((elapsed, msg))
             elif msg.type in ("control_change", "program_change", "pitchwheel"):
                 events.append((elapsed, msg))
@@ -513,6 +525,38 @@ def analyze_midi(path):
         "title": title, "author": author, "lyrics": lyrics,
         "tempo_events": tempo_events, "key_signature": key_signature,
     }
+
+
+def _build_note_spans(note_events):
+    """Accoppia gli eventi 'on'/'off' di note_events in "span" completi:
+    (tempo_on_sec, tempo_off_sec, tick_on, tick_off, canale, nota).
+
+    Serve alla piano roll per conoscere la durata di ogni nota (non solo il
+    suo istante di attacco) e scegliere di conseguenza la "forma" del
+    blocco da disegnare. Le percussioni (PERCUSSION_CHANNEL) sono escluse
+    a monte, come per il resto della piano roll/riconoscimento accordi.
+
+    L'accoppiamento è FIFO per (canale, nota): nel raro caso di note
+    sovrapposte identiche (stessa altezza, stesso canale, retrigger prima
+    del rilascio) il primo 'on' si accoppia al primo 'off' successivo.
+    Un eventuale 'on' senza un 'off' corrispondente (file troncato) viene
+    scartato piuttosto che rischiare una durata falsata.
+    """
+    pending = {}  # (channel, note) -> lista di (tempo_on_sec, tick_on) in attesa del rispettivo off
+    spans = []
+    for t, kind, channel, note, tick in note_events:
+        if channel == PERCUSSION_CHANNEL:
+            continue
+        key = (channel, note)
+        if kind == "on":
+            pending.setdefault(key, []).append((t, tick))
+        else:
+            queue = pending.get(key)
+            if queue:
+                on_t, on_tick = queue.pop(0)
+                spans.append((on_t, t, on_tick, tick, channel, note))
+    spans.sort(key=lambda s: s[0])
+    return spans
 
 
 class FluidSynthTrack:
@@ -555,8 +599,8 @@ class FluidSynthTrack:
         self.note_events = []
         self.events = []
         self._event_times = []
-        self._note_ons = []       # (tempo, nota) - solo note_on melodiche, per la piano roll
-        self._note_on_times = []
+        self._note_spans = []       # (on_sec, off_sec, on_tick, off_tick, canale, nota)
+        self._note_span_on_times = []
         self.title = None
         self.author = None
         self.lyrics = []
@@ -591,11 +635,8 @@ class FluidSynthTrack:
         self.note_events = info["note_events"]
         self.events = info["events"]
         self._event_times = [t for t, _ in self.events]
-        self._note_ons = [
-            (t, note, ch) for t, kind, ch, note in self.note_events
-            if kind == "on" and ch != PERCUSSION_CHANNEL
-        ]
-        self._note_on_times = [t for t, _, _ in self._note_ons]
+        self._note_spans = _build_note_spans(self.note_events)
+        self._note_span_on_times = [s[0] for s in self._note_spans]
         self._pitch_events = [(t, msg.channel) for t, msg in self.events if msg.type == "pitchwheel"]
         self._pitch_event_times = [t for t, _ in self._pitch_events]
         self.title = info["title"]
@@ -819,7 +860,7 @@ class FluidSynthTrack:
         """Ritorna la lista (canale, nota) attive nell'istante corrente, note melodiche escluse le percussioni."""
         t = self.elapsed()
         active = {}
-        for evt_time, kind, channel, note in self.note_events:
+        for evt_time, kind, channel, note, _tick in self.note_events:
             if evt_time > t:
                 break
             if channel == PERCUSSION_CHANNEL:
@@ -1070,13 +1111,35 @@ def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None, cle
 
 PITCH_CLASS_LABELS = ["Do", "D#", "Re", "R#", "Mi", "Fa", "F#", "So", "S#", "La", "L#", "Si"]
 
-# Caratteri della piano roll: blocchi Unicode pieni invece di simboli ASCII
-# rarefatti, per un colpo d'occhio più netto; un simbolo diverso segnala un
-# pitch bend in corso su quella nota, per distinguerlo da un semplice attacco.
-PIANO_ROLL_SOUND_CHAR = "█"     # nota che sta suonando davvero, adesso
-PIANO_ROLL_UPCOMING_CHAR = "▌"  # nota in arrivo nei prossimi istanti
-PIANO_ROLL_BEND_CHAR = "≈"      # nota che sta suonando E ha un pitch bend attivo
+# Caratteri della piano roll. Ogni nota "in arrivo" viene disegnata come un
+# blocco verticale la cui altezza (in righe) rispecchia la sua durata reale,
+# non un semplice trattino: la forma del blocco cambia in base a quanti
+# "tick" di griglia della piano roll occupa (vedi PIANO_ROLL_LOOKAHEAD/
+# PIANO_ROLL_ROWS più sotto per cosa si intende qui per "tick"):
+#   1 tick  -> un singolo blocco pieno isolato (nota staccatissima)
+#   2 tick  -> estremità superiore + inferiore, senza corpo centrale
+#   3+ tick -> estremità superiore, corpo pieno per i tick centrali, estremità inferiore
+# Quando la nota tocca davvero la riga di riproduzione (playhead, l'ultima
+# riga) il carattere su quella riga diventa sempre '#', a prescindere dalla
+# forma del blocco: è il segnale univoco "la nota sta suonando adesso".
+PIANO_ROLL_ATTACK_CHAR = "#"
+PIANO_ROLL_STACCATO_CHAR = "\u25a0"
+PIANO_ROLL_BLOCK_TOP = "\u2584"
+PIANO_ROLL_BLOCK_BODY = "\u2588"
+PIANO_ROLL_BLOCK_BOTTOM = "\u2580"
 PIANO_ROLL_BEND_WINDOW = 0.15   # secondi entro cui un pitchwheel è considerato "in corso"
+
+
+def _block_glyphs(span_rows):
+    """Ritorna la lista di caratteri (dall'alto verso il basso, cioè dal più
+    lontano nel tempo al più vicino) che compone il blocco di una nota in
+    base a quante righe della piano roll occupa: vedi le costanti
+    PIANO_ROLL_* sopra per il significato di ogni forma."""
+    if span_rows <= 1:
+        return [PIANO_ROLL_STACCATO_CHAR]
+    if span_rows == 2:
+        return [PIANO_ROLL_BLOCK_TOP, PIANO_ROLL_BLOCK_BOTTOM]
+    return [PIANO_ROLL_BLOCK_TOP] + [PIANO_ROLL_BLOCK_BODY] * (span_rows - 2) + [PIANO_ROLL_BLOCK_BOTTOM]
 
 
 def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
@@ -1084,10 +1147,10 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     rappresenta sempre la stessa nota (non si sposta seguendo cosa sta
     suonando in quel momento, altrimenti sarebbe impossibile seguirla a
     colpo d'occhio) e in basso è etichettata con il nome della nota
-    ("Do", "D#", "Re", ...). Il blocco '▌' scende riga dopo riga man mano
-    che il momento in cui la nota suona si avvicina; quando la nota suona
-    davvero, sull'ultima riga appare '█' (o '≈', in un colore dedicato, se in
-    quell'istante il canale ha anche un pitch bend attivo). Ogni nota è
+    ("Do", "D#", "Re", ...). Ogni nota "in arrivo" scende come un BLOCCO
+    (non un singolo punto) la cui altezza rispecchia la sua durata reale
+    (vedi _block_glyphs sopra); quando la nota suona davvero, sull'ultima
+    riga (il "playhead") il carattere diventa sempre '#'. Ogni nota è
     colorata in base al canale MIDI di provenienza (tipicamente melodia/
     basso/accompagnamento sono su canali diversi), se il terminale supporta
     i colori. L'etichetta della nota in basso si illumina con lo stesso
@@ -1095,10 +1158,11 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     l'animazione a colpo d'occhio.
 
     Le righe "in arrivo" partizionano l'intero intervallo di anticipo
-    (PIANO_ROLL_LOOKAHEAD secondi) in fasce di tempo CONTIGUE, una per riga,
-    senza spazi vuoti tra una fascia e l'altra: un evento di nota ricade
-    sempre in esattamente una fascia/riga, non può "cadere in un buco" tra
-    due finestre e sparire per un istante prima di suonare davvero.
+    (PIANO_ROLL_LOOKAHEAD secondi) in fasce di tempo CONTIGUE, una per riga
+    ("un tick di griglia" nel senso usato da _block_glyphs): un evento di
+    nota ricade sempre in esattamente una fascia/riga, non può "cadere in
+    un buco" tra due finestre e sparire per un istante prima di suonare
+    davvero.
 
     L'intervallo mostrato è sempre lo stesso per ogni brano: va dall'ottava
     PIANO_ROLL_START_OCTAVE per PIANO_ROLL_NUM_OCTAVES ottave (per default
@@ -1119,39 +1183,79 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     lane_width = max(2, min(4, width // max(1, lanes)))
 
     t_now = track.elapsed()
-    lo = bisect.bisect_left(track._note_on_times, t_now)
-    hi = bisect.bisect_right(track._note_on_times, t_now + PIANO_ROLL_LOOKAHEAD)
-    upcoming = track._note_ons[lo:hi]
+    hi = bisect.bisect_right(track._note_span_on_times, t_now + PIANO_ROLL_LOOKAHEAD)
+    # Non basta più "attacco non ancora avvenuto" (on_t >= t_now): una nota
+    # lunga deve restare visibile ANCHE dopo l'attacco, finché non è del
+    # tutto conclusa, altrimenti il blocco sparirebbe di colpo nell'istante
+    # in cui tocca il playhead invece di scorrerci dentro gradualmente. Si
+    # scartano quindi solo le note già del tutto concluse (off_t <= t_now);
+    # quelle ancora in corso (anche iniziate molto prima di questa finestra)
+    # restano candidate.
+    upcoming = [s for s in track._note_spans[:hi] if s[1] > t_now]
     active_now = track.active_notes()  # lista di (canale, nota)
     active_by_note = {note: ch for ch, note in active_now}
 
-    # canali con un pitch bend "in corso" adesso, per il simbolo/colore speciale
+    # canali con un pitch bend "in corso" adesso: non cambia più il
+    # carattere sul playhead (che resta sempre '#'), ma continua a
+    # distinguersi con un colore dedicato invece del colore di canale.
     plo = bisect.bisect_left(track._pitch_event_times, t_now - PIANO_ROLL_BEND_WINDOW)
     phi = bisect.bisect_right(track._pitch_event_times, t_now + PIANO_ROLL_BEND_WINDOW)
     bending_channels = {ch for _, ch in track._pitch_events[plo:phi]}
 
     # Righe disponibili per le note "in arrivo" (tutte tranne l'ultima, che è
-    # "ora"): l'intervallo [0, PIANO_ROLL_LOOKAHEAD) viene diviso in altrettante
-    # fasce di uguale durata. Per ogni nota calcoliamo la riga in cui si trova
-    # in questo istante (0 = in alto/più lontana, upcoming_rows-1 = subito
-    # prima di suonare) e disegniamo una barra CONTINUA dalla riga 0 fino a
-    # quella riga inclusa: man mano che la nota si avvicina la riga cresce e
-    # la barra si allunga verso il basso, invece di un singolo punto isolato
-    # che salta da una riga alla successiva (e che, tra l'altro, dava anche
-    # l'impressione sbagliata che le note "sparissero" invaso da altre celle).
-    # Se più occorrenze della stessa nota cadono nella finestra di anticipo,
-    # si tiene la più vicina (riga più bassa): la sua barra 0..riga copre
-    # comunque per unione anche quella delle occorrenze più lontane.
+    # il playhead/"ora"): l'intervallo [0, PIANO_ROLL_LOOKAHEAD) viene diviso
+    # in altrettante fasce di uguale durata ("i tick di griglia" della piano
+    # roll). Per ogni nota calcoliamo la riga "di base" del blocco (foot_row)
+    # in modo CONTINUO nel tempo, non solo finché l'attacco non è ancora
+    # avvenuto: anche dopo l'attacco, foot_row continua a crescere oltre
+    # l'ultima riga disponibile, così il blocco (ancorato a foot_row e esteso
+    # verso l'alto per span_rows righe) continua a "scorrere dentro" il
+    # playhead invece di sparire di colpo - la sua parte restante rimane
+    # visibile finché non è stata interamente consumata.
+    #
+    # Se sulla STESSA lane (stessa altezza) cadono più occorrenze nella
+    # finestra (es. due note staccate consecutive), vengono disegnate
+    # TUTTE, non solo la più vicina: altrimenti la seconda comparirebbe dal
+    # nulla solo dopo che la prima è stata consumata. Le righe vengono
+    # quindi accumulate per lane invece di scegliere un'unica "vincitrice";
+    # solo se due occorrenze si contendono la STESSA riga (capita se sono
+    # molto ravvicinate nel tempo) vince quella più vicina/urgente, dando
+    # priorità visiva a chi sta per suonare a breve.
     upcoming_rows = PIANO_ROLL_ROWS - 1
     bin_width = PIANO_ROLL_LOOKAHEAD / upcoming_rows
-    note_fill_row = {}  # nota -> (riga più bassa raggiunta, canale di quell'occorrenza)
-    for t, note, ch in upcoming:
-        remaining = max(0.0, t - t_now)
-        bin_idx = min(int(remaining / bin_width), upcoming_rows - 1)
-        row_idx = upcoming_rows - 1 - bin_idx  # più lontana nel tempo = più in alto (riga 0)
-        prev = note_fill_row.get(note)
-        if prev is None or row_idx > prev[0]:
-            note_fill_row[note] = (row_idx, ch)
+    note_block = {}  # nota -> {riga: (glifo, canale)}, accumulo di tutte le occorrenze in finestra
+    # upcoming è già in ordine crescente di on_t (più lontana -> più vicina):
+    # processandolo al contrario, l'update() finale lascia vincere sulle
+    # righe in conflitto sempre l'occorrenza più vicina nel tempo.
+    for on_t, off_t, on_tick, off_tick, ch, note in reversed(upcoming):
+        # "quanti tick di griglia" occupa la nota: le note davvero cortissime
+        # (1-2 tick MIDI grezzi, es. abbellimenti/grace note) restano sempre
+        # un blocco minimo indipendentemente dalla scala del brano; le note
+        # "normali" (3+ tick) vengono invece proporzionate alla loro durata
+        # reale convertita nella griglia a righe della piano roll.
+        tick_duration = off_tick - on_tick
+        if tick_duration <= 1:
+            span_rows = 1
+        elif tick_duration == 2:
+            span_rows = 2
+        else:
+            span_rows = max(1, round((off_t - on_t) / bin_width))
+
+        remaining = on_t - t_now  # negativo se l'attacco è già avvenuto: non viene più troncato a 0
+        foot_row = round((upcoming_rows - 1) - remaining / bin_width)
+        top_row = foot_row - (span_rows - 1)
+
+        glyphs = _block_glyphs(span_rows)
+        rows_for_this_note = {}
+        for offset, glyph in enumerate(glyphs):
+            r = top_row + offset
+            if 0 <= r <= upcoming_rows - 1:
+                rows_for_this_note[r] = (glyph, ch)
+
+        if not rows_for_this_note:
+            continue  # nulla di visibile in questo istante (nota già del tutto "entrata")
+
+        note_block.setdefault(note, {}).update(rows_for_this_note)
 
     for r in range(PIANO_ROLL_ROWS):
         is_now_row = r == PIANO_ROLL_ROWS - 1
@@ -1164,9 +1268,9 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
             if is_now_row and note in active_by_note:
                 channel = active_by_note[note]
                 is_bending = channel in bending_channels
-                symbol = PIANO_ROLL_BEND_CHAR if is_bending else PIANO_ROLL_SOUND_CHAR
-            elif not is_now_row and note in note_fill_row and r <= note_fill_row[note][0]:
-                symbol, channel = PIANO_ROLL_UPCOMING_CHAR, note_fill_row[note][1]
+                symbol = PIANO_ROLL_ATTACK_CHAR
+            elif not is_now_row and note in note_block and r in note_block[note]:
+                symbol, channel = note_block[note][r]
             if symbol is None:
                 cell = " " * lane_width  # colonna vuota: niente puntini quando non c'è nulla in arrivo
                 attr = curses.A_NORMAL
@@ -1194,6 +1298,7 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
         else:
             attr = curses.A_DIM
         draw_line(stdscr, cache, labels_row, col, label, attr, key=("pianoroll_label", lane), clear_to_eol=False)
+
 
 
 def curses_prompt(stdscr, message):
