@@ -6,8 +6,8 @@ A lightweight, responsive, and elegant command-line MIDI player written in Pytho
 
 ## Benchmark & Resource Footprint
 Tested under strict Linux `systemd-run` cgroup limits:
-* **CPU Usage:** Flawless real-time playback down to **2% of a single core** with default buffer settings.
-* **RAM Footprint:** ~264 MB total (using a ~240 MB GM SoundFont).
+* **CPU Usage:** Flawless real-time playback down to **2% of a single core** with default buffer settings. Responsiveness is instantaneous thanks to event-based threading that eliminates polling overhead.
+* **RAM Footprint:** ~264 MB total (using a ~240 MB GM SoundFont). Memory management is highly optimized, utilizing zero-allocation chord detection (`frozenset`) and `itertools.islice` to prevent memory copying during piano roll rendering.
 * **Robustness:** Starts and runs down to **1% CPU** (requires larger buffer size).
 
 ---
@@ -20,23 +20,25 @@ Tested under strict Linux `systemd-run` cgroup limits:
   * **Karaoke / Lyrics**: Extraction and synchronized display of lyrics and metadata (`title`, `copyright`, `lyrics`/`text`).
   * **Piano Roll**: ASCII-based visual representation of upcoming notes, colored by MIDI channel.
   * **Progress Bar**: Monitoring with elapsed time and total duration timestamps.
+  * **Smart UI Formatting**: Elegant truncation (`...`) of excessively long track titles to preserve the layout structure.
 * **Advanced Playback Controls**:
   * Play, pause, restart, and fast forward/rewind (± 5 seconds).
   * Dynamic adjustment of **playback speed** (from `0.25x` to `3.00x`).
   * On-the-fly **volume / gain** control.
   * **Transpose**: Shift pitch up or down by semitones (±24).
+* **Quality of Life (QoL) Features**:
+  * **Preventive Auto-Gain (Opt-in)**: Analyzes MIDI velocity and average polyphony upon file load to intelligently scale the synthesizer's gain multiplier, normalizing track volumes without expensive audio DSP overhead.
+  * **State Persistence**: The application remembers your exact setup (SoundFont, master volume, shuffle/loop modes, and active QoL flags) across restarts.
 * **Practice Mode (MIDI Channel Mute)**:
   * Instantly mute or unmute any of the 16 MIDI channels (keys `1-9`, `0` for drums/percussion on channel 10, `F1-F6` for channels 11-16).
   * Perfect for removing a specific track (e.g., piano or guitar) and using the playback as a backing track for practice.
   * Change instruments on the fly (Program Change).
 * **Playlist Management**:
   * Play single `.mid`/`.midi` files or entire directories.
-  * Support for **Shuffle** and **Loop** modes (Off, Loop All, Loop Single).
+  * Support for **Deck Shuffle** (True Shuffle preventing repeated tracks until the queue finishes) and **Loop** modes (Off, Loop All, Loop Single).
   * **Quick Search**: Real-time playlist filtering to instantly find tracks in large libraries.
-* **MPRIS Integration**: 
-  * Support for system media controls (media keys, desktop audio widgets) via D-Bus session.
-* **Persistent Configuration**:
-  * Automatically saves the last used SoundFont and directory in `~/.config/midiplayer/config.json`.
+* **MPRIS Integration (Opt-in)**:
+  * Support for system media controls (media keys, desktop audio widgets) via D-Bus session. 
 
 ---
 
@@ -145,7 +147,7 @@ python3 midiplayer.py
 | :--- | :--- |
 | `SPACE` | Pause / Resume playback |
 | `←` / `→` | Skip backward / forward by 5 seconds |
-| `N` / `B` | Skip to the next / previous track |
+| `N` / `B` | Skip to the next / previous track (navigates shuffle queue) |
 | `R` | Restart the current track from the beginning |
 | `↑` / `↓` | Navigate the playlist (visual selection) |
 | `ENTER` | Start playing the selected track in the playlist |
@@ -154,6 +156,7 @@ python3 midiplayer.py
 | `[` / `]` | Transpose down / up by a semitone (up to ±24) |
 | `L` | Toggle Loop mode (`Off` -> `All` -> `Single`) |
 | `S` | Enable / disable random playback (`Shuffle`) |
+| `G` | Toggle Preventive Auto-Gain |
 | `1` – `9` | Mute / unmute MIDI channels 1 to 9 |
 | `0` | Mute / unmute MIDI channel 10 (Percussion / Drums) |
 | `F1` – `F6` | Mute / unmute MIDI channels 11 to 16 |
@@ -173,7 +176,9 @@ If you experience audio crackling or distortion, you can tweak the engine's play
 * **Fix sample rate (e.g., for PipeWire):** `--sample-rate 48000`
 * **Lower gain to avoid clipping:** `--gain 0.3`
 * **Disable effects (reverb/chorus) on slower machines:** `--no-effects`
-* **Disable MPRIS integration:** `--no-mpris`
+* **Enable MPRIS integration:** `--enable-mpris` 
+
+*(Note: Explicit CLI flags for `--gain`, `--loop`, or `--shuffle` will override any saved states).*
 
 ---
 
@@ -183,18 +188,19 @@ In the releases section of this repository, you can find older versions of this 
 
 ---
 
-## Configuration File
+## Configuration & State Files
 
-Parameters entered in interactive mode are saved in the JSON configuration file:
-`~/.config/midiplayer/config.json`
+Parameters and runtime preferences are saved across two JSON files in `~/.config/midiplayer/`:
 
-Example file structure:
-```json
-{
-  "soundfont": "/usr/share/sounds/sf2/FluidR3_GM.sf2",
-  "midi_path": "/home/user/Music/MIDI"
-}
-```
+1. **`config.json`**: Saves foundational preferences like the last used SoundFont and MIDI directory.
+   Example file structure:
+   ```json
+   {
+     "soundfont": "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+     "midi_path": "/home/user/Music/MIDI"
+   }
+   ```
+2. **`state.json`**: Automatically saves the active playback state upon exiting, including volume, shuffle modes, loop statuses, and active QoL flags (such as Auto-Gain and MPRIS).
 
 ---
 
