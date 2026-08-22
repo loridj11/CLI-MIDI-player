@@ -24,9 +24,8 @@ Requisiti:
     - un SoundFont (.sf2), es. FluidR3_GM.sf2
     - opzionale, per i controlli multimediali di sistema (MPRIS): "pydbus" e
       PyGObject ("gi"), più un D-Bus session bus disponibile (assente in
-      molte sessioni SSH senza sessione desktop). Se mancano, il player
-      funziona comunque normalmente da tastiera, semplicemente senza i
-      controlli di sistema (si può disattivare esplicitamente con --no-mpris).
+      molte sessioni SSH senza sessione desktop). Funzionalità disattivata
+      di default (opt-in): va attivata esplicitamente con --enable-mpris.
         pip install pydbus PyGObject
         (su Debian/Ubuntu spesso più semplice via pacchetti di sistema:
          sudo apt install python3-pydbus python3-gi)
@@ -87,11 +86,12 @@ presenti, i testi (lyrics) sincronizzati come in un karaoke. Se il terminale
 supporta i colori, barra di avanzamento/stato sono verdi/ciano e l'accordo
 rilevato è in giallo per risaltare a colpo d'occhio.
 
-Se pydbus/PyGObject sono disponibili (vedi Requisiti), il player si registra
-anche come sorgente MPRIS sul D-Bus session bus: i tasti multimediali della
-tastiera e il widget audio di sistema (es. quello di GNOME/KDE) possono così
-mettere in pausa, cambiare traccia o regolare il volume anche mentre il
-terminale non è in primo piano. Disattivabile con --no-mpris.
+Se pydbus/PyGObject sono disponibili (vedi Requisiti), passando --enable-mpris
+il player si registra anche come sorgente MPRIS sul D-Bus session bus: i tasti
+multimediali della tastiera e il widget audio di sistema (es. quello di
+GNOME/KDE) possono così mettere in pausa, cambiare traccia o regolare il
+volume anche mentre il terminale non è in primo piano. Disattivato di
+default (opt-in); una volta attivato resta ricordato per gli avvii successivi.
 
 Se l'audio gracchia/distorce:
     - aumenta il buffer: --period-size 2048 --periods 6 (o valori più alti)
@@ -106,6 +106,7 @@ import argparse
 import bisect
 import contextlib
 import curses
+import itertools
 import json
 import os
 import random
@@ -212,6 +213,16 @@ PIANO_ROLL_START_OCTAVE = 1  # ottava più bassa mostrata (1 = Do1/nota MIDI 24)
 PIANO_ROLL_NUM_OCTAVES = 6   # quante ottave mostrare: modifica questo valore per ampliare/restringere la piano roll
 
 CONFIG_PATH = os.path.expanduser("~/.config/midiplayer/config.json")
+STATE_PATH = os.path.expanduser("~/.config/midiplayer/state.json")
+
+# Funzionalità QoL disattivate di default (opt-in): l'utente le accende
+# esplicitamente da tastiera o da riga di comando. Questo dizionario è
+# l'unica fonte di verità sul loro stato, sia a runtime sia nel file di
+# stato persistente (STATE_PATH).
+DEFAULT_QOL_FLAGS = {
+    "auto_gain": False,  # G: Auto-Gain preventivo (vedi compute_auto_gain_factor)
+    "mpris": False,      # controlli multimediali di sistema (vedi anche --enable-mpris)
+}
 
 
 def load_config():
@@ -229,6 +240,31 @@ def save_config(cfg):
             json.dump(cfg, f, indent=2)
     except Exception:
         pass  # il salvataggio della configurazione non è critico
+
+
+def load_state():
+    """Carica lo stato di sessione persistente (STATE_PATH): ultimo
+    SoundFont, volume, modalità shuffle/loop e flag QoL. Distinto da
+    CONFIG_PATH, che ricorda solo i valori suggeriti nei prompt interattivi
+    di avvio (soundfont/cartella MIDI)."""
+    try:
+        with open(STATE_PATH, "r") as f:
+            state = json.load(f)
+    except Exception:
+        state = {}
+    qol = dict(DEFAULT_QOL_FLAGS)
+    qol.update(state.get("qol") or {})
+    state["qol"] = qol
+    return state
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with open(STATE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass  # il salvataggio dello stato non è critico: non deve mai far fallire l'uscita
 
 
 def prompt_with_default(message, default):
@@ -288,6 +324,20 @@ def format_time(seconds):
     return f"{m:02d}:{s:02d}"
 
 
+def truncate_text(text, max_width):
+    """Accorcia 'text' a max_width caratteri con puntini di sospensione se
+    troppo lungo, invece di un taglio netto senza preavviso: usata per i
+    titoli lunghi nella playlist e nell'intestazione del brano corrente.
+    """
+    if max_width <= 0:
+        return ""
+    if len(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return text[:max_width]
+    return text[: max_width - 3] + "..."
+
+
 NOTE_NAMES = ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"]
 
 # Canale MIDI 10 (indice 9) è convenzionalmente riservato alla batteria/percussioni:
@@ -295,24 +345,28 @@ NOTE_NAMES = ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", 
 # quindi lo escludiamo dal riconoscimento di note/accordi e dalla piano roll.
 PERCUSSION_CHANNEL = 9
 
+# I pattern sono frozenset pre-calcolati (non tuple): guess_chord() viene
+# richiamata a ogni frame della UI mentre il brano suona, quindi evitare di
+# ricostruire un set() da zero per ciascun template a ogni chiamata toglie
+# un po' di lavoro inutile al garbage collector.
 CHORD_TEMPLATES = [
-    ("maj7", (0, 4, 7, 11)),
-    ("7", (0, 4, 7, 10)),
-    ("min7", (0, 3, 7, 10)),
-    ("dim7", (0, 3, 6, 9)),
-    ("m7b5", (0, 3, 6, 10)),
-    ("maj9", (0, 2, 4, 7, 11)),
-    ("9", (0, 2, 4, 7, 10)),
-    ("min9", (0, 2, 3, 7, 10)),
-    ("6", (0, 4, 7, 9)),
-    ("min6", (0, 3, 7, 9)),
-    ("add9", (0, 2, 4, 7)),
-    ("maj", (0, 4, 7)),
-    ("min", (0, 3, 7)),
-    ("dim", (0, 3, 6)),
-    ("aug", (0, 4, 8)),
-    ("sus4", (0, 5, 7)),
-    ("sus2", (0, 2, 7)),
+    ("maj7", frozenset((0, 4, 7, 11))),
+    ("7", frozenset((0, 4, 7, 10))),
+    ("min7", frozenset((0, 3, 7, 10))),
+    ("dim7", frozenset((0, 3, 6, 9))),
+    ("m7b5", frozenset((0, 3, 6, 10))),
+    ("maj9", frozenset((0, 2, 4, 7, 11))),
+    ("9", frozenset((0, 2, 4, 7, 10))),
+    ("min9", frozenset((0, 2, 3, 7, 10))),
+    ("6", frozenset((0, 4, 7, 9))),
+    ("min6", frozenset((0, 3, 7, 9))),
+    ("add9", frozenset((0, 2, 4, 7))),
+    ("maj", frozenset((0, 4, 7))),
+    ("min", frozenset((0, 3, 7))),
+    ("dim", frozenset((0, 3, 6))),
+    ("aug", frozenset((0, 4, 8))),
+    ("sus4", frozenset((0, 5, 7))),
+    ("sus2", frozenset((0, 2, 7))),
 ]
 
 # Peso di ogni intervallo (in semitoni dalla fondamentale) nel punteggio di
@@ -448,7 +502,7 @@ def guess_chord(notes):
     for root in pitch_classes:
         intervals_present = set((pc - root) % 12 for pc in pitch_classes)
         for name, template in CHORD_TEMPLATES:
-            template_set = set(template)
+            template_set = template  # già un frozenset pre-calcolato, nessuna conversione a runtime
             matched = template_set & intervals_present
             missing = template_set - intervals_present
             extra = intervals_present - template_set
@@ -667,6 +721,52 @@ def _build_note_spans(note_events):
     return spans
 
 
+REFERENCE_VELOCITY = 90.0    # velocity "tipica" usata come riferimento neutro (fattore 1.0)
+REFERENCE_POLYPHONY = 3.0    # numero di note simultanee "tipico" usato come riferimento neutro
+AUTO_GAIN_FACTOR_RANGE = (0.4, 2.5)  # limiti del fattore di densità stimato, per evitare correzioni estreme
+
+
+def compute_auto_gain_factor(events, duration):
+    """Stima un fattore di scala del gain analizzando SOLO i metadati degli
+    eventi MIDI del brano (velocity delle note_on e polifonia media nel
+    tempo) — nessun rendering audio, nessuna analisi del segnale reale.
+
+    Un brano denso e/o con velocity alte ottiene un fattore < 1 (il volume
+    verrà ridotto), uno sparso e quieto un fattore > 1 (verrà alzato): lo
+    scopo è livellare l'impatto sonoro percepito passando da un file
+    all'altro, non è un limitatore/compressore vero e proprio.
+
+    Ritorna 1.0 (nessuna correzione) se non c'è materiale sufficiente per
+    stimarlo (brano senza note, o durata nulla).
+    """
+    velocities = []
+    concurrent = 0
+    weighted_concurrent_time = 0.0
+    last_t = 0.0
+    for t, msg in events:
+        if msg.type == "note_on" and msg.velocity > 0:
+            weighted_concurrent_time += concurrent * (t - last_t)
+            concurrent += 1
+            velocities.append(msg.velocity)
+            last_t = t
+        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            weighted_concurrent_time += concurrent * (t - last_t)
+            concurrent = max(0, concurrent - 1)
+            last_t = t
+
+    if not velocities or duration <= 0:
+        return 1.0
+
+    avg_velocity = sum(velocities) / len(velocities)
+    avg_polyphony = weighted_concurrent_time / duration
+
+    velocity_factor = avg_velocity / REFERENCE_VELOCITY
+    polyphony_factor = avg_polyphony / REFERENCE_POLYPHONY if avg_polyphony > 0 else 1.0
+    density_factor = velocity_factor * polyphony_factor
+    density_factor = max(AUTO_GAIN_FACTOR_RANGE[0], min(AUTO_GAIN_FACTOR_RANGE[1], density_factor))
+    return 1.0 / density_factor
+
+
 class FluidSynthTrack:
     """Pilota un'istanza di FluidSynth (via pyfluidsynth) per UN singolo file MIDI.
 
@@ -730,9 +830,18 @@ class FluidSynthTrack:
 
         self.muted_channels = set()
 
+        self.auto_gain = False       # Auto-Gain preventivo (QoL, opt-in): vedi compute_auto_gain_factor()
+        self.auto_gain_factor = 1.0  # fattore applicato all'ultima analisi, solo per mostrarlo in UI
+
         self._gen = 0            # invalidato ad ogni start/seek/reposition
         self._thread = None
         self._stop_flag = False
+        # Sveglia il thread di riproduzione all'istante (invece di lasciarlo
+        # scoprire un cambio di stato al prossimo risveglio "a scadenza"):
+        # ogni metodo che altera pausa/velocità/posizione lo imposta, il
+        # loop lo attende con event.wait(timeout) invece di time.sleep(),
+        # così CPU sprecata e latenza di reazione sono entrambe minime.
+        self._wake_event = threading.Event()
 
     # ---- gestione del thread di riproduzione --------------------------------
     def start(self, path):
@@ -759,6 +868,7 @@ class FluidSynthTrack:
         self._song_pos = 0.0
         self._anchor = time.monotonic()
 
+        self._apply_gain()  # ricalcola l'Auto-Gain (se attivo) per il brano appena caricato
         self._resync_state(0.0, retrigger_notes=False)
         self._spawn_thread(0)
 
@@ -772,6 +882,7 @@ class FluidSynthTrack:
 
     def _stop_thread(self):
         self._stop_flag = True
+        self._wake_event.set()  # sveglia subito il thread se sta aspettando, invece di lasciarlo scadere
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self._thread = None
@@ -788,16 +899,28 @@ class FluidSynthTrack:
         n = len(self.events)
         while not self._stop_flag and gen == self._gen:
             if self.paused:
-                time.sleep(0.01)
+                # attesa "inattiva": nessuna scadenza stretta serve qui, dato
+                # che pause()/resume() chiamano _wake_event.set() e ci
+                # svegliano subito; il timeout resta solo come rete di
+                # sicurezza in caso (non dovrebbe succedere) di un set() mancato
+                self._wake_event.wait(timeout=0.5)
+                self._wake_event.clear()
                 continue
             if idx >= n:
-                time.sleep(0.05)
+                self._wake_event.wait(timeout=0.5)
+                self._wake_event.clear()
                 continue
             t_event, msg = self.events[idx]
             now = self.elapsed()
             wait = (t_event - now) / max(self.speed, 0.0001)
             if wait > 0.002:
-                time.sleep(min(wait, 0.02))
+                # qui il timeout ha un tetto più basso perché è la vera
+                # attesa "di scaletta": se nel frattempo arriva un seek/
+                # cambio velocità, _wake_event.set() ci risveglia comunque
+                # all'istante e si ricalcola tutto da capo (self.speed,
+                # self.elapsed() vengono riletti a ogni iterazione)
+                self._wake_event.wait(timeout=min(wait, 0.05))
+                self._wake_event.clear()
                 continue
             try:
                 self._apply_message(msg)
@@ -887,6 +1010,7 @@ class FluidSynthTrack:
         trasposizione/cambio SoundFont: è l'unico punto che sa come
         riallineare in modo coerente audio e stato interno."""
         self._stop_flag = True
+        self._wake_event.set()  # sveglia subito il thread in attesa, invece di lasciarlo scadere
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
 
@@ -904,11 +1028,13 @@ class FluidSynthTrack:
             self.paused = True
             for ch in range(16):
                 self.synth.cc(ch, 123, 0)  # All Notes Off: silenzia subito ciò che suona
+            self._wake_event.set()
 
     def resume(self):
         if self.paused:
             self._anchor = time.monotonic()
             self.paused = False
+            self._wake_event.set()
 
     def toggle_pause(self):
         self.pause() if not self.paused else self.resume()
@@ -931,11 +1057,30 @@ class FluidSynthTrack:
         return (not self.paused) and self.duration > 0 and self.elapsed() >= self.duration
 
     # ---- volume ---------------------------------------------------------------
-    def change_gain(self, delta):
-        self.gain = max(GAIN_MIN, min(GAIN_MAX, self.gain + delta))
+    def _apply_gain(self):
+        """Applica al synth il gain effettivo: quello impostato manualmente
+        dall'utente (self.gain), eventualmente scalato dal fattore di
+        Auto-Gain se attivo. Richiamata sia quando l'utente cambia volume
+        manualmente sia a ogni caricamento di un nuovo brano (l'Auto-Gain,
+        se attivo, viene ricalcolato per il file appena caricato)."""
+        if self.auto_gain:
+            self.auto_gain_factor = compute_auto_gain_factor(self.events, self.duration)
+        else:
+            self.auto_gain_factor = 1.0
+        effective = max(GAIN_MIN, min(GAIN_MAX, self.gain * self.auto_gain_factor))
         # 'synth.gain' è una impostazione di FluidSynth modificabile in tempo
         # reale: non serve ricreare il synth né inviare comandi separati.
-        self.synth.setting("synth.gain", self.gain)
+        self.synth.setting("synth.gain", effective)
+
+    def set_auto_gain(self, enabled):
+        """Attiva/disattiva l'Auto-Gain e riapplica subito il gain (anche
+        per il brano correntemente in riproduzione, non solo dal prossimo)."""
+        self.auto_gain = enabled
+        self._apply_gain()
+
+    def change_gain(self, delta):
+        self.gain = max(GAIN_MIN, min(GAIN_MAX, self.gain + delta))
+        self._apply_gain()
 
     # ---- velocità di riproduzione -----------------------------------------------
     def change_speed(self, delta):
@@ -952,6 +1097,7 @@ class FluidSynthTrack:
         self._song_pos = self.elapsed()
         self._anchor = time.monotonic()
         self.speed = new_speed
+        self._wake_event.set()  # il thread potrebbe star aspettando un evento col vecchio 'wait' calcolato alla velocità precedente
 
     # ---- trasposizione ----------------------------------------------------------
     def change_transpose(self, delta):
@@ -1065,6 +1211,19 @@ class Playlist:
         self.shuffle = False
         self.loop_mode = "off"  # "off", "all" (ripeti tutto), "single" (ripeti singolo)
 
+        # "Deck shuffle" (vero shuffle senza ripetizioni): a differenza di
+        # self.shuffle (che pesca un indice casuale a ogni next/prev, quindi
+        # può ripresentare lo stesso brano anche a breve distanza), qui si
+        # mescola un "mazzo" di indici che viene consumato senza ripetizioni
+        # finché non si esaurisce, momento in cui ne viene mescolato uno
+        # nuovo. Uno storico separato (_history/_history_pos) permette a
+        # prev() di tornare davvero indietro nella sequenza già pescata
+        # invece di pescare un'altra carta casuale.
+        self.deck_shuffle = False
+        self._deck = []          # indici ancora da pescare nel mazzo corrente
+        self._history = []       # indici già pescati, nell'ordine in cui sono stati suonati
+        self._history_pos = -1   # posizione corrente dentro _history
+
     @property
     def current(self):
         return self.files[self.index]
@@ -1075,9 +1234,42 @@ class Playlist:
         choices = [i for i in range(len(self.files)) if i != self.index]
         return random.choice(choices)
 
+    def _build_deck(self, exclude_index=None):
+        """Crea un nuovo mazzo: una permutazione casuale di tutti gli indici
+        della playlist. Se exclude_index è indicato e capita di finire in
+        prima posizione, viene scambiato con un altro elemento, così il
+        brano appena ascoltato non riparte subito anche al "giro" successivo."""
+        n = len(self.files)
+        if n == 0:
+            return []
+        indices = list(range(n))
+        random.shuffle(indices)
+        if exclude_index is not None and n > 1 and indices[0] == exclude_index:
+            indices[0], indices[1] = indices[1], indices[0]
+        return indices
+
+    def _draw_from_deck(self):
+        if not self._deck:
+            self._deck = self._build_deck(exclude_index=self.index)
+        if not self._deck:
+            return self.index
+        return self._deck.pop(0)
+
     def next(self):
         if not self.files:
             return False
+        if self.deck_shuffle:
+            if self._history_pos < len(self._history) - 1:
+                # si era tornati indietro con prev(): si riprende in avanti
+                # la stessa sequenza già pescata, senza consumare il mazzo
+                self._history_pos += 1
+            else:
+                new_index = self._draw_from_deck()
+                self._history.append(new_index)
+                self._history_pos = len(self._history) - 1
+            self.index = self._history[self._history_pos]
+            self.selected = self.index
+            return True
         if self.shuffle:
             self.index = self._random_index()
             self.selected = self.index
@@ -1095,6 +1287,13 @@ class Playlist:
     def prev(self):
         if not self.files:
             return False
+        if self.deck_shuffle:
+            if self._history_pos > 0:
+                self._history_pos -= 1
+                self.index = self._history[self._history_pos]
+                self.selected = self.index
+                return True
+            return False
         if self.shuffle:
             self.index = self._random_index()
             self.selected = self.index
@@ -1107,7 +1306,18 @@ class Playlist:
 
     def toggle_shuffle(self):
         self.shuffle = not self.shuffle
+        if self.shuffle:
+            self.deck_shuffle = False  # le due modalità di shuffle sono mutuamente esclusive
         return self.shuffle
+
+    def toggle_deck_shuffle(self):
+        self.deck_shuffle = not self.deck_shuffle
+        if self.deck_shuffle:
+            self.shuffle = False  # mutuamente esclusivo con lo shuffle "classico"
+            self._history = [self.index]
+            self._history_pos = 0
+            self._deck = self._build_deck(exclude_index=self.index)
+        return self.deck_shuffle
 
     def cycle_loop_mode(self):
         order = ["off", "all", "single"]
@@ -1502,11 +1712,17 @@ class MPRISBridge:
             self.track.change_speed(value - self.track.speed)
 
     def shuffle(self):
-        return self.playlist.shuffle
+        return self.playlist.shuffle or self.playlist.deck_shuffle
 
     def set_shuffle(self, value):
         with self.lock:
+            # MPRIS espone un solo booleano: da un widget di sistema si può
+            # solo accendere/spegnere lo shuffle "classico". La modalità
+            # "mazzo" (senza ripetizioni) resta un'estensione richiedibile
+            # solo dalla tastiera (tasto D), perché lo standard non la prevede.
             self.playlist.shuffle = bool(value)
+            if self.playlist.shuffle:
+                self.playlist.deck_shuffle = False
 
     def metadata(self):
         path = self.playlist.current if self.playlist.files else ""
@@ -1715,7 +1931,7 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     # scartano quindi solo le note già del tutto concluse (off_t <= t_now);
     # quelle ancora in corso (anche iniziate molto prima di questa finestra)
     # restano candidate.
-    upcoming = [s for s in track._note_spans[:hi] if s[1] > t_now]
+    upcoming = [s for s in itertools.islice(track._note_spans, hi) if s[1] > t_now]
     active_now = track.active_notes()  # lista di (canale, nota)
     active_by_note = {note: ch for ch, note in active_now}
 
@@ -1928,7 +2144,7 @@ def curses_prompt(stdscr, message):
 
 
 def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
-           period_size, periods, sample_rate, no_effects, enable_mpris=True):
+           period_size, periods, sample_rate, no_effects, qol_flags):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)  # ms, controlla anche il refresh della UI
@@ -1937,6 +2153,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     track = FluidSynthTrack(soundfont, audio_driver, gain,
                              period_size=period_size, periods=periods,
                              sample_rate=sample_rate, no_effects=no_effects)
+    track.auto_gain = qol_flags["auto_gain"]  # applicato da start() -> _apply_gain() qui sotto
     track.start(playlist.current)
 
     status_msg = ""
@@ -1963,8 +2180,8 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     mpris = MPRISBridge(track, playlist, state_lock,
                          on_track_change=lambda: track.start(playlist.current),
                          on_quit_request=quit_event.set)
-    mpris_active = enable_mpris and mpris.start()
-    if enable_mpris and not mpris_active:
+    mpris_active = qol_flags["mpris"] and mpris.start()
+    if qol_flags["mpris"] and not mpris_active:
         # le librerie ci sono ma l'avvio è fallito comunque: molto più utile
         # indicarlo subito che lasciar credere che sia tutto a posto
         status_msg = "MPRIS non avviato: controlla il terminale e il log"
@@ -2003,8 +2220,11 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             file_stem = os.path.splitext(os.path.basename(playlist.current))[0]
             bpm_str = f"{track.current_bpm()} BPM"
             key_str = track.key_signature or "-"
+            prefix = "In riproduzione: "
+            suffix = f"  |  {bpm_str}  |  Tonalita': {key_str}"
+            stem_budget = max(10, (w - 4) - len(prefix) - len(suffix))
             draw_line(stdscr, render_cache, row, 2,
-                      f"In riproduzione: {file_stem}  |  {bpm_str}  |  Tonalita': {key_str}"[: w - 4])
+                      f"{prefix}{truncate_text(file_stem, stem_budget)}{suffix}"[: w - 4])
             row += 1
             draw_line(stdscr, render_cache, row, 2,
                       (f"Autore/copyright: {track.author}" if track.author else "")[: w - 4])
@@ -2023,10 +2243,23 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             draw_line(stdscr, render_cache, row, 2, f"Stato: {state}", progress_attr)
             row += 1
 
+            if playlist.deck_shuffle:
+                shuffle_label = "Mazzo"
+            elif playlist.shuffle:
+                shuffle_label = "Casuale"
+            else:
+                shuffle_label = "Off"
+            if qol_flags["auto_gain"]:
+                auto_gain_label = f"ON (x{track.auto_gain_factor:.2f})"
+            else:
+                auto_gain_label = "OFF"
+            mpris_label = "ON" if mpris_active else "OFF"
             info_line = (f"Volume: {track.gain:.2f}  Velocita': {track.speed:.2f}x  "
                          f"Trasposizione: {track.transpose:+d}  "
                          f"Loop: {LOOP_LABELS[playlist.loop_mode]}  "
-                         f"Shuffle: {'ON' if playlist.shuffle else 'OFF'}")
+                         f"Shuffle: {shuffle_label}  "
+                         f"AutoGain: {auto_gain_label}  "
+                         f"MPRIS: {mpris_label}")
             draw_line(stdscr, render_cache, row, 2, info_line[: w - 4])
             row += 1
 
@@ -2116,7 +2349,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                     attr |= curses.color_pair(COLOR_PAIR_ACTIVE_TRACK) | curses.A_BOLD
                 if is_selected:
                     attr |= curses.A_REVERSE
-                line = f"{marker} {fname}"[: w - 4]
+                line = f"{marker} {truncate_text(fname, max(1, w - 6))}"
                 draw_line(stdscr, render_cache, list_start_row + r, 4, line, attr)
             if not visible_slice and search_query:
                 draw_line(stdscr, render_cache, list_start_row, 4, "(nessun risultato)"[: w - 4], curses.A_DIM)
@@ -2128,7 +2361,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
 
             if show_help:
                 help1 = ("SPAZIO pausa | <-/-> 5s | N/B brano | R riavvia | SU/GIU/INVIO playlist | "
-                         "L loop | S shuffle | / cerca")
+                         "L loop | S shuffle | D mazzo | G auto-gain | / cerca")
                 help2 = ("+/- volume | </> velocita' | [/] trasposizione | P programma | "
                          "1-9,0/F1-F6 muta canale | F7 SoundFont")
                 mpris_note = "  | MPRIS: ON" if mpris_active else ""
@@ -2270,6 +2503,15 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             elif key in (ord("s"), ord("S")):
                 enabled = playlist.toggle_shuffle()
                 status_msg = "Shuffle attivato" if enabled else "Shuffle disattivato"
+            elif key in (ord("d"), ord("D")):
+                enabled = playlist.toggle_deck_shuffle()
+                status_msg = "Deck shuffle attivato (nessuna ripetizione)" if enabled else "Deck shuffle disattivato"
+            elif key in (ord("g"), ord("G")):
+                qol_flags["auto_gain"] = not qol_flags["auto_gain"]
+                with state_lock:
+                    track.set_auto_gain(qol_flags["auto_gain"])
+                status_msg = ("Auto-Gain attivato (gain scalato in base alla densita' del brano)"
+                              if qol_flags["auto_gain"] else "Auto-Gain disattivato")
             elif key == ord("/"):
                 search_mode = True
             elif key in (ord("?"), ord("h"), ord("H")):
@@ -2340,6 +2582,20 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
         mpris.stop()
         track.stop_process()
 
+        if playlist.deck_shuffle:
+            shuffle_mode = "deck"
+        elif playlist.shuffle:
+            shuffle_mode = "classic"
+        else:
+            shuffle_mode = "off"
+        save_state({
+            "soundfont": soundfont,
+            "gain": track.gain,
+            "shuffle_mode": shuffle_mode,
+            "loop_mode": playlist.loop_mode,
+            "qol": qol_flags,
+        })
+
 
 def export_to_wav(path, soundfont, out_path, gain=0.5, sample_rate=44100,
                    no_effects=False, tail_seconds=2.0):
@@ -2401,7 +2657,8 @@ def main():
     parser.add_argument("--soundfont", help="Percorso del file SoundFont (.sf2)")
     parser.add_argument("--audio-driver", default=None,
                          help="Driver audio per fluidsynth (es. alsa, pulseaudio, coreaudio, dsound)")
-    parser.add_argument("--gain", type=float, default=0.5, help="Guadagno audio (default 0.5)")
+    parser.add_argument("--gain", type=float, default=None,
+                         help="Guadagno audio (default: quello salvato nello stato, altrimenti 0.5)")
     parser.add_argument("--period-size", type=int, default=1024,
                          help="Dimensione del buffer audio in campioni (default 1024; "
                               "aumentalo, es. 2048 o 4096, se l'audio gracchia)")
@@ -2413,12 +2670,16 @@ def main():
     parser.add_argument("--no-effects", action="store_true",
                          help="Disattiva riverbero e chorus per ridurre il carico sulla CPU "
                               "(utile su macchine lente se l'audio gracchia)")
-    parser.add_argument("--shuffle", action="store_true", help="Avvia la playlist in modalità casuale")
+    parser.add_argument("--shuffle", action="store_true",
+                         help="Avvia la playlist in modalità casuale classica "
+                              "(default: quella salvata nello stato)")
     parser.add_argument("--loop", choices=["off", "all", "single"], default="off",
-                         help="Modalità di ripetizione iniziale (default: off)")
-    parser.add_argument("--no-mpris", action="store_true",
-                         help="Disattiva l'integrazione MPRIS (controlli multimediali di sistema), "
-                              "anche se pydbus/PyGObject sono installati")
+                         help="Modalità di ripetizione iniziale "
+                              "(default: quella salvata nello stato, altrimenti off)")
+    parser.add_argument("--enable-mpris", action="store_true",
+                         help="Attiva l'integrazione MPRIS (controlli multimediali di sistema, "
+                              "richiede pydbus/PyGObject). Disattivata di default (opt-in); "
+                              "una volta attivata resta memorizzata nello stato per gli avvii successivi.")
     parser.add_argument("--export", metavar="OUTPUT",
                          help="Non avvia l'interfaccia: renderizza i file MIDI in WAV (rendering "
                               "offline, più veloce del tempo reale). Con un solo file, OUTPUT è il "
@@ -2426,6 +2687,7 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config()
+    state = load_state()
 
     # --- SoundFont: usa l'argomento da riga di comando, altrimenti chiedi ---
     if args.soundfont:
@@ -2483,15 +2745,28 @@ def main():
         for src, dst in targets:
             print(f"Rendering '{src}' -> '{dst}' ...")
             try:
-                export_to_wav(src, soundfont, dst, gain=args.gain,
+                export_to_wav(src, soundfont, dst, gain=(args.gain if args.gain is not None else 0.5),
                                sample_rate=sample_rate, no_effects=args.no_effects)
             except Exception as e:
                 print(f"  Errore durante l'esportazione: {e}")
         return
 
     playlist = Playlist(files)
-    playlist.shuffle = args.shuffle
-    playlist.loop_mode = args.loop
+    # Loop/shuffle: la riga di comando ha la precedenza solo se esplicitamente
+    # diversa dal default "spento", altrimenti si riparte da quanto salvato
+    # nello stato dell'ultima sessione (STATE_PATH).
+    playlist.loop_mode = args.loop if args.loop != "off" else state.get("loop_mode", "off")
+    shuffle_mode = "classic" if args.shuffle else state.get("shuffle_mode", "off")
+    if shuffle_mode == "deck":
+        playlist.toggle_deck_shuffle()
+    elif shuffle_mode == "classic":
+        playlist.toggle_shuffle()
+
+    gain = args.gain if args.gain is not None else state.get("gain", 0.5)
+
+    qol_flags = dict(state["qol"])  # già completo di tutte le chiavi note (load_state le fonde coi default)
+    if args.enable_mpris:
+        qol_flags["mpris"] = True
 
     # Non solo all'avvio: durante la riproduzione FluidSynth può scrivere
     # avvisi direttamente sul file descriptor dello stderr di sistema (es.
@@ -2502,9 +2777,9 @@ def main():
     # sessione curses, non solo il caricamento del SoundFont.
     with _suppress_native_output():
         curses.wrapper(
-            run_ui, soundfont, args.audio_driver, args.gain, playlist,
+            run_ui, soundfont, args.audio_driver, gain, playlist,
             args.period_size, args.periods, args.sample_rate, args.no_effects,
-            enable_mpris=not args.no_mpris,
+            qol_flags,
         )
 
     print("Riproduzione terminata.")
