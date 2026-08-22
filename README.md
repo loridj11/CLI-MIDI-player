@@ -204,6 +204,12 @@ Parameters and runtime preferences are saved across two JSON files in `~/.config
 
 ---
 
+## TUI Preview:
+
+![MidiPlayer Demo](assets/demo_cut.gif)
+
+---
+
 ## Credits & Acknowledgments
 
 This project relies on the following open-source software and components:
