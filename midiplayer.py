@@ -1821,10 +1821,11 @@ class MPRISBridge:
 # Numeri di color pair curses (inizializzati in init_colors(), chiamata una
 # sola volta all'avvio della UI): definiti qui come costanti così il resto
 # del codice li referenzia per nome invece che per numero magico.
-COLOR_PAIR_PROGRESS = 1   # barra di avanzamento e stato di riproduzione (verde/cyan)
+COLOR_PAIR_PROGRESS = 1   # barra di avanzamento e stato di riproduzione, quando è in play (verde/cyan)
 COLOR_PAIR_CHORD = 2      # accordo rilevato in tempo reale (giallo/arancione)
-COLOR_PAIR_ACTIVE_TRACK = 3  # icona ▶ della traccia in riproduzione nella playlist
+COLOR_PAIR_ACTIVE_TRACK = 3  # icona ▶ della traccia in riproduzione nella playlist, quando è in play
 COLOR_PAIR_BEND = 4       # nota con pitch bend attivo nella piano roll (si distingue dal colore di canale)
+COLOR_PAIR_PAUSED = 5     # stato, barra di avanzamento e riga della playlist quando il brano è in pausa (rosso)
 
 # Piano roll: una tavolozza di colori ciclica assegnata per canale MIDI, così
 # note di canali diversi (tipicamente melodia/basso/accompagnamento) si
@@ -1855,6 +1856,7 @@ def init_colors():
         curses.init_pair(COLOR_PAIR_CHORD, curses.COLOR_YELLOW, bg)
         curses.init_pair(COLOR_PAIR_ACTIVE_TRACK, curses.COLOR_GREEN, bg)
         curses.init_pair(COLOR_PAIR_BEND, curses.COLOR_RED, bg)
+        curses.init_pair(COLOR_PAIR_PAUSED, curses.COLOR_RED, bg)
         for i, color in enumerate(PIANO_ROLL_CHANNEL_COLORS):
             curses.init_pair(PIANO_ROLL_CHANNEL_PAIR_BASE + i, color, bg)
     except curses.error:
@@ -2214,6 +2216,15 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)  # ms, controlla anche il refresh della UI
+    try:
+        # ridondante rispetto a ESCDELAY impostata in main() prima di
+        # curses.wrapper() (che dovrebbe già bastare): un ulteriore livello
+        # di sicurezza per i casi in cui quella lettura non avesse effetto.
+        # Richiede Python 3.9+; sulle versioni precedenti resta solo la via
+        # della variabile d'ambiente.
+        curses.set_escdelay(25)
+    except AttributeError:
+        pass
     colors_enabled = init_colors()
 
     track = FluidSynthTrack(soundfont, audio_driver, gain,
@@ -2242,9 +2253,18 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     state_lock = threading.Lock()
 
     def load_index(i):
+        # Se il brano selezionato è già quello in riproduzione, invece di
+        # ricaricarlo da capo (track.start(), che riparsa l'intero file MIDI:
+        # pesante da ripetere ad ogni ripetizione se si tiene premuto INVIO)
+        # ci si limita a riavviarlo, esattamente come il tasto R - un'operazione
+        # leggera perché non tocca il file, solo la posizione di riproduzione.
+        if i == playlist.index:
+            track.restart()
+            return False
         playlist.index = i
         playlist.selected = i
         track.start(playlist.current)
+        return True
 
     mpris = MPRISBridge(track, playlist, state_lock,
                          on_track_change=lambda: track.start(playlist.current),
@@ -2303,7 +2323,11 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             total = track.duration
             bar_width = max(10, w - 20)
             bar = draw_progress_bar(bar_width, elapsed / total if total else 0)
-            progress_attr = curses.color_pair(COLOR_PAIR_PROGRESS) if colors_enabled else curses.A_NORMAL
+            # in pausa la barra e lo stato diventano rossi, per un segnale visivo
+            # immediato di "fermo", invece del verde/ciano usato durante il play
+            progress_attr = curses.color_pair(
+                COLOR_PAIR_PAUSED if track.paused else COLOR_PAIR_PROGRESS
+            ) if colors_enabled else curses.A_NORMAL
             draw_line(stdscr, render_cache, row, 2,
                       f"{format_time(elapsed)} [{bar}] {format_time(total)}"[: w - 2], progress_attr)
             row += 2
@@ -2323,12 +2347,12 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             else:
                 auto_gain_label = "OFF"
             mpris_label = "ON" if mpris_active else "OFF"
-            info_line = (f"Volume: {track.gain:.2f}  Velocita': {track.speed:.2f}x  "
-                         f"Trasposizione: {track.transpose:+d}  "
-                         f"Loop: {LOOP_LABELS[playlist.loop_mode]}  "
-                         f"Shuffle: {shuffle_label}  "
-                         f"AutoGain: {auto_gain_label}  "
-                         f"MPRIS: {mpris_label}  "
+            info_line = (f"Volume: {track.gain:.2f}  | Velocita': {track.speed:.2f}x | "
+                         f"Trasposizione: {track.transpose:+d} | "
+                         f"Loop: {LOOP_LABELS[playlist.loop_mode]} | "
+                         f"Shuffle: {shuffle_label} | "
+                         f"AutoGain: {auto_gain_label} | "
+                         f"MPRIS: {mpris_label} | "
                          f"Notazione: {NOTATION_LABELS[notation]}")
             draw_line(stdscr, render_cache, row, 2, info_line[: w - 4])
             row += 1
@@ -2416,7 +2440,10 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 marker = "\u25b6" if is_playing else " "  # ▶
                 attr = curses.A_NORMAL
                 if colors_enabled and is_playing:
-                    attr |= curses.color_pair(COLOR_PAIR_ACTIVE_TRACK) | curses.A_BOLD
+                    # rosso quando in pausa, verde quando in play: stesso
+                    # segnale visivo usato per stato e barra di avanzamento
+                    pair = COLOR_PAIR_PAUSED if track.paused else COLOR_PAIR_ACTIVE_TRACK
+                    attr |= curses.color_pair(pair) | curses.A_BOLD
                 if is_selected:
                     attr |= curses.A_REVERSE
                 line = f"{marker} {truncate_text(fname, max(1, w - 6))}"
@@ -2493,8 +2520,9 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                     search_mode = False
                     if filtered_indices:
                         with state_lock:
-                            load_index(playlist.selected)
-                        status_msg = f"Riproduzione: {os.path.basename(playlist.current)}"
+                            reloaded = load_index(playlist.selected)
+                        status_msg = (f"Riproduzione: {os.path.basename(playlist.current)}" if reloaded
+                                      else "Brano riavviato")
                     else:
                         status_msg = "Nessun risultato per la ricerca"
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
@@ -2510,6 +2538,13 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             if key == curses.KEY_RESIZE:
                 render_cache.clear()
                 stdscr.erase()
+            elif key == 27 and search_query:
+                # ESC fuori dalla barra di ricerca (quindi non già gestito
+                # sopra): se un filtro è ancora attivo dall'ultima ricerca,
+                # lo cancella e torna a mostrare la playlist intera.
+                search_query = ""
+                playlist.selected = playlist.index
+                status_msg = "Filtro rimosso"
             elif key in (ord("q"), ord("Q")):
                 break
             elif key == ord(" "):
@@ -2545,8 +2580,9 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 move_selection(1)
             elif key in (curses.KEY_ENTER, 10, 13):
                 with state_lock:
-                    load_index(playlist.selected)
-                status_msg = f"Riproduzione: {os.path.basename(playlist.current)}"
+                    reloaded = load_index(playlist.selected)
+                status_msg = (f"Riproduzione: {os.path.basename(playlist.current)}" if reloaded
+                              else "Brano riavviato")
             elif key in (ord("+"), ord("="), curses.KEY_PPAGE):
                 track.change_gain(GAIN_STEP)
                 status_msg = f"Volume: {track.gain:.2f}"
@@ -2855,6 +2891,15 @@ def main():
     qol_flags = dict(state["qol"])  # già completo di tutte le chiavi note (load_state le fonde coi default)
     if args.enable_mpris:
         qol_flags["mpris"] = True
+
+    # ncurses attende di default fino a ESCDELAY millisecondi (1000ms) dopo
+    # aver ricevuto ESC, prima di decidere che non è l'inizio di una sequenza
+    # multi-tasto (come le frecce, che iniziano anch'esse con ESC): senza
+    # questa modifica, ogni singola pressione di ESC nell'interfaccia
+    # "congelava" la UI per circa un secondo. Va impostata come variabile
+    # d'ambiente PRIMA che ncurses si inizializzi (dentro curses.wrapper),
+    # altrimenti arriva troppo tardi per essere letta.
+    os.environ.setdefault("ESCDELAY", "25")
 
     # Non solo all'avvio: durante la riproduzione FluidSynth può scrivere
     # avvisi direttamente sul file descriptor dello stderr di sistema (es.
