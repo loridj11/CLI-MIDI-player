@@ -206,7 +206,7 @@ Parameters and runtime preferences are saved across two JSON files in `~/.config
 
 ## TUI Preview:
 
-![MidiPlayer Demo](assets/demo_cut.gif)
+![MidiPlayer Demo](assets/demo.gif)
 
 ---
 
