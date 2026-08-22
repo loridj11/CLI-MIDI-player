@@ -73,6 +73,9 @@ Comandi da tastiera:
                 (utile con librerie di centinaia di file); SU/GIU scorrono
                 solo tra i risultati, INVIO riproduce quello selezionato,
                 ESC annulla e torna alla playlist intera
+    T           Salta a un punto preciso del brano: chiede un timestamp nel
+                formato MM:SS (es. "1:30") o secondi puri (es. "90");
+                è anche possibile usare H:MM:SS per brani molto lunghi
     ? / H       Mostra/nasconde la legenda comandi (nascosta di default, per
                 lasciare più spazio verticale a piano roll e playlist)
     Q           Esci
@@ -104,6 +107,7 @@ Se l'audio gracchia/distorce:
 
 import argparse
 import bisect
+import builtins
 import contextlib
 import curses
 import itertools
@@ -222,6 +226,7 @@ STATE_PATH = os.path.expanduser("~/.config/midiplayer/state.json")
 DEFAULT_QOL_FLAGS = {
     "auto_gain": False,  # G: Auto-Gain preventivo (vedi compute_auto_gain_factor)
     "mpris": False,      # controlli multimediali di sistema (vedi anche --enable-mpris)
+    "notation": "latin_mixed",  # C: notazione piano roll/note (deve combaciare con DEFAULT_NOTATION più sotto)
 }
 
 
@@ -324,6 +329,34 @@ def format_time(seconds):
     return f"{m:02d}:{s:02d}"
 
 
+def parse_timestamp(s):
+    """Converte una stringa timestamp in secondi (float).
+
+    Formati accettati:
+        SS          secondi interi o con decimali  (es. "90", "90.5")
+        MM:SS       minuti:secondi                 (es. "1:30", "01:30")
+        H:MM:SS     ore:minuti:secondi             (es. "1:02:30")
+
+    Ritorna i secondi come float, o None se il formato non è riconosciuto
+    o il valore non è un numero valido.
+    """
+    s = s.strip()
+    parts = s.split(":")
+    try:
+        if len(parts) == 1:
+            # Secondi puri (int o float)
+            return float(parts[0])
+        elif len(parts) == 2:
+            # MM:SS
+            return int(parts[0]) * 60 + float(parts[1])
+        elif len(parts) == 3:
+            # H:MM:SS
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 def truncate_text(text, max_width):
     """Accorcia 'text' a max_width caratteri con puntini di sospensione se
     troppo lungo, invece di un taglio netto senza preavviso: usata per i
@@ -338,7 +371,47 @@ def truncate_text(text, max_width):
     return text[: max_width - 3] + "..."
 
 
-NOTE_NAMES = ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"]
+# --- Notazione musicale selezionabile a runtime (tasto C) -----------------
+# Sei combinazioni possibili: 2 sistemi (Latino/Anglosassone) x 3 stili di
+# alterazione (Mista/Solo diesis/Solo bemolle). Sono definite due tabelle
+# per ciascuna modalità:
+#   NOTATION_COMPACT  usata dalla piano roll (colonne strette, max 2-4 caratteri)
+#   NOTATION_FULL     usata da note_name()/guess_chord() (più spazio, es. "Sol#4")
+# La modalità "Mista" è quella storicamente già in uso in tutto il player
+# (compresa la spellatura degli accordi) ed è il default all'avvio.
+NOTATION_MODES = ["latin_mixed", "latin_sharp", "latin_flat",
+                   "anglo_mixed", "anglo_sharp", "anglo_flat"]
+NOTATION_LABELS = {
+    "latin_mixed": "Latina mista",
+    "latin_sharp": "Latina diesis",
+    "latin_flat": "Latina bemolle",
+    "anglo_mixed": "Anglosassone mista",
+    "anglo_sharp": "Anglosassone diesis",
+    "anglo_flat": "Anglosassone bemolle",
+}
+DEFAULT_NOTATION = "latin_mixed"
+
+NOTATION_COMPACT = {
+    "latin_mixed": ["Do", "D#", "Re", "Mb", "Mi", "Fa", "F#", "So", "S#", "La", "Sb", "Si"],
+    "latin_sharp": ["Do", "D#", "Re", "R#", "Mi", "Fa", "F#", "So", "S#", "La", "L#", "Si"],
+    "latin_flat":  ["Do", "Db", "Re", "Mb", "Mi", "Fa", "Gb", "So", "Ab", "La", "Sb", "Si"],
+    "anglo_mixed": ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"],
+    "anglo_sharp": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"],
+    "anglo_flat":  ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"],
+}
+NOTATION_FULL = {
+    "latin_mixed": ["Do", "Do#", "Re", "Mib", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "Sib", "Si"],
+    "latin_sharp": ["Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si"],
+    "latin_flat":  ["Do", "Reb", "Re", "Mib", "Mi", "Fa", "Solb", "Sol", "Lab", "La", "Sib", "Si"],
+    "anglo_mixed": ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "G#", "A", "Bb", "B"],
+    "anglo_sharp": ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"],
+    "anglo_flat":  ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"],
+}
+
+
+def cycle_notation(current):
+    i = NOTATION_MODES.index(current)
+    return NOTATION_MODES[(i + 1) % len(NOTATION_MODES)]
 
 # Canale MIDI 10 (indice 9) è convenzionalmente riservato alla batteria/percussioni:
 # i "note number" lì indicano lo strumento percosso, non un'altezza musicale,
@@ -405,14 +478,8 @@ CHORD_MISSING_PENALTY_MULT = 1.5  # amplifica il costo dei toni mancanti in prop
 CHORD_EXTRA_PENALTY = 1           # penalità per ogni nota extra SENZA un'etichetta di tensione nota
 CHORD_MIN_COVERAGE = 0.45         # copertura minima (peso presente / peso totale template) per accettare
 
-# Spelling "a bemolle" per le fondamentali dei tasti neri dove è la grafia di
-# gran lunga più comune nei chart reali (Reb, Mib, Lab, Sib). Fa#/Solb resta
-# col diesis perché "Fa#" è la spellatura standard, specie per dim/m7b5.
-FLAT_ROOT_SPELLING = {1: "Reb", 3: "Mib", 8: "Lab", 10: "Sib"}
-
-
-def spell_root(pitch_class):
-    return FLAT_ROOT_SPELLING.get(pitch_class, NOTE_NAMES[pitch_class])
+def spell_root(pitch_class, notation=DEFAULT_NOTATION):
+    return NOTATION_FULL[notation][pitch_class]
 
 
 # mido esprime la tonalità (meta-evento "key_signature") con la notazione
@@ -449,13 +516,13 @@ def sanitize_text(text):
     return cleaned.strip()
 
 
-def note_name(midi_note):
-    name = NOTE_NAMES[midi_note % 12]
+def note_name(midi_note, notation=DEFAULT_NOTATION):
+    name = NOTATION_FULL[notation][midi_note % 12]
     octave = midi_note // 12 - 1
     return f"{name}{octave}"
 
 
-def guess_chord(notes):
+def guess_chord(notes, notation=DEFAULT_NOTATION):
     """Prova a riconoscere un accordo comune dato un insieme di note MIDI attive.
 
     A differenza di una semplice riduzione a classi di altezza (0-11), qui si
@@ -483,8 +550,9 @@ def guess_chord(notes):
     coincide con la nota al basso (ipotesi più probabile in stato fondamentale).
 
     Infine, alla fondamentale e all'eventuale nota al basso viene applicata
-    una spellatura "a bemolle" per i tasti neri dove è la grafia standard nei
-    chart reali (es. la radice sul semitono 10 diventa "Sib", non "La#").
+    la spellatura della notazione musicale correntemente selezionata (tasto
+    C, vedi NOTATION_FULL): stessa tabella usata da note_name() e dalla
+    piano roll, per coerenza in tutta la UI.
     """
     notes = sorted(set(notes))
     if len(notes) < 2:
@@ -538,11 +606,11 @@ def guess_chord(notes):
         return None
 
     _, _, name, root, labeled_extras = best
-    chord_name = f"{spell_root(root)} {name}"
+    chord_name = f"{spell_root(root, notation)} {name}"
     if labeled_extras and len(labeled_extras) <= MAX_EXTENSIONS_SHOWN:
         chord_name += f" ({','.join(EXTENSION_LABELS[i] for i in labeled_extras)})"
     if bass_pitch_class != root:
-        chord_name += f" / {spell_root(bass_pitch_class)}"
+        chord_name += f" / {spell_root(bass_pitch_class, notation)}"
     return chord_name
 
 
@@ -1849,8 +1917,6 @@ def draw_line(stdscr, cache, row, col, text, attr=curses.A_NORMAL, key=None, cle
     cache[cache_key] = entry
 
 
-PITCH_CLASS_LABELS = ["Do", "D#", "Re", "R#", "Mi", "Fa", "F#", "So", "S#", "La", "L#", "Si"]
-
 # Caratteri della piano roll. Ogni nota "in arrivo" viene disegnata come un
 # blocco verticale la cui altezza (in righe) rispecchia la sua durata reale,
 # non un semplice trattino: la forma del blocco cambia in base a quanti
@@ -1882,7 +1948,7 @@ def _block_glyphs(span_rows):
     return [PIANO_ROLL_BLOCK_TOP] + [PIANO_ROLL_BLOCK_BODY] * (span_rows - 2) + [PIANO_ROLL_BLOCK_BOTTOM]
 
 
-def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
+def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled, notation=DEFAULT_NOTATION):
     """Disegna una mini piano-roll ASCII a colonne fisse: ogni colonna
     rappresenta sempre la stessa nota (non si sposta seguendo cosa sta
     suonando in quel momento, altrimenti sarebbe impossibile seguirla a
@@ -2025,7 +2091,7 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
     labels_row = row0 + 1 + PIANO_ROLL_ROWS
     for lane, note in enumerate(range(low_note, low_note + lanes)):
         col = col0 + lane * lane_width
-        label = PITCH_CLASS_LABELS[note % 12].ljust(lane_width)
+        label = NOTATION_COMPACT[notation][note % 12].ljust(lane_width)
         if note in active_by_note:
             # la nota sta suonando adesso: l'etichetta si illumina con lo
             # stesso colore/intensità della cella nella riga "ora" sopra,
@@ -2160,6 +2226,9 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     render_cache = {}
     prev_size = stdscr.getmaxyx()
     show_help = False  # la legenda comandi compare solo premendo ?/H, per lasciare più spazio verticale
+    notation = qol_flags.get("notation", DEFAULT_NOTATION)  # tasto C: cicla le 6 combinazioni di notazione
+    if notation not in NOTATION_MODES:
+        notation = DEFAULT_NOTATION  # stato salvato da una versione precedente o corrotto: ripiega sul default
     search_mode = False   # True mentre si digita nella barra di ricerca playlist ('/')
     search_query = ""
     quit_event = threading.Event()  # impostato da MPRIS Quit() per chiedere l'uscita dal loop principale
@@ -2259,7 +2328,8 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                          f"Loop: {LOOP_LABELS[playlist.loop_mode]}  "
                          f"Shuffle: {shuffle_label}  "
                          f"AutoGain: {auto_gain_label}  "
-                         f"MPRIS: {mpris_label}")
+                         f"MPRIS: {mpris_label}  "
+                         f"Notazione: {NOTATION_LABELS[notation]}")
             draw_line(stdscr, render_cache, row, 2, info_line[: w - 4])
             row += 1
 
@@ -2272,14 +2342,14 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
 
             active = track.active_notes()
             if active:
-                names = [note_name(note) for _, note in active]
+                names = [note_name(note, notation) for _, note in active]
                 notes_line = "Note: " + ", ".join(names)
             else:
                 notes_line = "Note: -"
             draw_line(stdscr, render_cache, row, 2, notes_line[: w - 4])
             row += 1
 
-            chord = guess_chord(note for _, note in active) if len(active) >= 2 else None
+            chord = guess_chord((note for _, note in active), notation) if len(active) >= 2 else None
             chord_line = f"Accordo: {chord}" if chord else "Accordo: -"
             chord_attr = (curses.color_pair(COLOR_PAIR_CHORD) | curses.A_BOLD) if (colors_enabled and chord) else curses.A_NORMAL
             draw_line(stdscr, render_cache, row, 2, chord_line[: w - 4], chord_attr)
@@ -2296,7 +2366,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 draw_line(stdscr, render_cache, row, 2, (f"> {lyric}" if lyric else "")[: w - 4], curses.A_BOLD)
             row += 2
 
-            render_piano_roll(stdscr, render_cache, track, row, 2, w - 2, colors_enabled)
+            render_piano_roll(stdscr, render_cache, track, row, 2, w - 2, colors_enabled, notation)
             row += PIANO_ROLL_ROWS + 3  # header + righe + etichette note + una riga di spaziatura
 
             # Filtro di ricerca rapida ('/'): filtered_indices è la lista di
@@ -2361,8 +2431,8 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
 
             if show_help:
                 help1 = ("SPAZIO pausa | <-/-> 5s | N/B brano | R riavvia | SU/GIU/INVIO playlist | "
-                         "L loop | S shuffle | D mazzo | G auto-gain | / cerca")
-                help2 = ("+/- volume | </> velocita' | [/] trasposizione | P programma | "
+                         "L loop | S shuffle | D mazzo | G auto-gain | C notazione | / cerca")
+                help2 = ("+/- volume | </> velocita' | [/] trasposizione | P programma | T timestamp | "
                          "1-9,0/F1-F6 muta canale | F7 SoundFont")
                 mpris_note = "  | MPRIS: ON" if mpris_active else ""
                 help3 = f"?/H nascondi comandi | Q esci{mpris_note}"
@@ -2512,8 +2582,25 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                     track.set_auto_gain(qol_flags["auto_gain"])
                 status_msg = ("Auto-Gain attivato (gain scalato in base alla densita' del brano)"
                               if qol_flags["auto_gain"] else "Auto-Gain disattivato")
+            elif key in (ord("c"), ord("C")):
+                notation = cycle_notation(notation)
+                status_msg = f"Notazione: {NOTATION_LABELS[notation]}"
             elif key == ord("/"):
                 search_mode = True
+            elif key in (ord("t"), ord("T")):
+                raw = curses_prompt(stdscr, "Vai a (MM:SS o secondi, es. '1:30' o '90'): ")
+                render_cache.clear()
+                stdscr.erase()
+                if raw:
+                    target_sec = parse_timestamp(raw)
+                    if target_sec is not None:
+                        target_sec = max(0.0, min(track.duration, target_sec))
+                        with state_lock:
+                            track._reposition(target_sec)
+                        status_msg = f"Salto a {format_time(target_sec)}"
+                    else:
+                        status_msg = "Formato non valido: usa 'MM:SS' (es. '1:30') o secondi (es. '90')"
+
             elif key in (ord("?"), ord("h"), ord("H")):
                 show_help = not show_help
                 render_cache.clear()
@@ -2588,6 +2675,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             shuffle_mode = "classic"
         else:
             shuffle_mode = "off"
+        qol_flags["notation"] = notation  # ricorda l'ultima notazione scelta (tasto C) tra una sessione e l'altra
         save_state({
             "soundfont": soundfont,
             "gain": track.gain,
