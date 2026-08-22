@@ -9,7 +9,7 @@ Tested under strict Linux `systemd-run` cgroup limits:
 * **CPU Usage:** Flawless real-time playback down to **2% of a single core** with default buffer settings.
 * **RAM Footprint:** ~264 MB total (using a ~240 MB GM SoundFont).
 * **Robustness:** Starts and runs down to **1% CPU** (requires larger buffer size).
-  
+
 ---
 
 ## Key Features
@@ -18,17 +18,23 @@ Tested under strict Linux `systemd-run` cgroup limits:
 * **Real-time Visualization**:
   * **Chords and Notes**: Smart chord recognition during playback, including **inversion** detection (e.g., `C maj / E` when the lowest note is the bass rather than the root).
   * **Karaoke / Lyrics**: Extraction and synchronized display of lyrics and metadata (`title`, `copyright`, `lyrics`/`text`).
+  * **Piano Roll**: ASCII-based visual representation of upcoming notes, colored by MIDI channel.
   * **Progress Bar**: Monitoring with elapsed time and total duration timestamps.
 * **Advanced Playback Controls**:
   * Play, pause, restart, and fast forward/rewind (± 5 seconds).
   * Dynamic adjustment of **playback speed** (from `0.25x` to `3.00x`).
   * On-the-fly **volume / gain** control.
+  * **Transpose**: Shift pitch up or down by semitones (±24).
 * **Practice Mode (MIDI Channel Mute)**:
   * Instantly mute or unmute any of the 16 MIDI channels (keys `1-9`, `0` for drums/percussion on channel 10, `F1-F6` for channels 11-16).
   * Perfect for removing a specific track (e.g., piano or guitar) and using the playback as a backing track for practice.
+  * Change instruments on the fly (Program Change).
 * **Playlist Management**:
   * Play single `.mid`/`.midi` files or entire directories.
   * Support for **Shuffle** and **Loop** modes (Off, Loop All, Loop Single).
+  * **Quick Search**: Real-time playlist filtering to instantly find tracks in large libraries.
+* **MPRIS Integration**: 
+  * Support for system media controls (media keys, desktop audio widgets) via D-Bus session.
 * **Persistent Configuration**:
   * Automatically saves the last used SoundFont and directory in `~/.config/midiplayer/config.json`.
 
@@ -65,6 +71,13 @@ The project relies mostly on the Python standard library (`curses`, `json`, `arg
 ```bash
 pip install mido pyFluidSynth
 ```
+
+### 4. Optional Dependencies (MPRIS System Controls)
+To enable system media keys and desktop audio widget controls, `pydbus` and `PyGObject` are required:
+* **Debian / Ubuntu**: `sudo apt install python3-pydbus python3-gi`
+* **Pip**: `pip install pydbus PyGObject`
+
+*(Note: If these are missing, the player will still function perfectly via keyboard without system controls).*
 
 ---
 
@@ -114,6 +127,16 @@ python3 midiplayer.py
   python3 midiplayer.py --soundfont /path/to/FluidR3_GM.sf2 --dir ./midi --loop all --shuffle
   ```
 
+* **Specify Audio Driver (e.g., pulseaudio, alsa, pipewire):**
+  ```bash
+  python3 midiplayer.py --soundfont FluidR3_GM.sf2 --dir ./midi --audio-driver pulseaudio
+  ```
+
+* **Offline Export to WAV (Fast rendering, no UI):**
+  ```bash
+  python3 midiplayer.py --soundfont FluidR3_GM.sf2 track.mid --export track.wav
+  ```
+
 ---
 
 ## Keyboard Shortcuts
@@ -122,41 +145,35 @@ python3 midiplayer.py
 | :--- | :--- |
 | `SPACE` | Pause / Resume playback |
 | `←` / `→` | Skip backward / forward by 5 seconds |
-| `N` | Skip to the next track |
-| `B` | Go back to the previous track |
+| `N` / `B` | Skip to the next / previous track |
 | `R` | Restart the current track from the beginning |
 | `↑` / `↓` | Navigate the playlist (visual selection) |
 | `ENTER` | Start playing the selected track in the playlist |
 | `+` / `-` | Increase / decrease volume (Gain) |
 | `<` / `>` | Slow down / speed up playback (0.25x ... 3.00x) |
+| `[` / `]` | Transpose down / up by a semitone (up to ±24) |
 | `L` | Toggle Loop mode (`Off` -> `All` -> `Single`) |
 | `S` | Enable / disable random playback (`Shuffle`) |
 | `1` – `9` | Mute / unmute MIDI channels 1 to 9 |
 | `0` | Mute / unmute MIDI channel 10 (Percussion / Drums) |
 | `F1` – `F6` | Mute / unmute MIDI channels 11 to 16 |
+| `F7` | Open Visual SoundFont Browser |
+| `P` | Change instrument (Program Change) for a channel |
+| `/` | Quick search / filter in the playlist |
+| `?` / `H` | Show / hide the commands legend |
 | `Q` | Quit the program |
 
 ---
 
-## Command Line Options
+## Advanced Startup Variables & Troubleshooting
 
-```
-Usage: midiplayer.py [-h] [--dir DIR] [--soundfont SOUNDFONT]
-                     [--gain GAIN]
-                     [--shuffle] [--loop {off,all,single}]
-                     [files ...]
+If you experience audio crackling or distortion, you can tweak the engine's playback variables at startup:
 
-Positional arguments:
-  files                 .mid/.midi files to add to the playlist
-
-General options:
-  --dir DIR             Directory containing .mid/.midi files
-  --soundfont SOUNDFONT Path to the SoundFont file (.sf2)
-  --gain GAIN           Initial audio gain (default: 0.5)
-  --shuffle             Start the playlist in shuffle mode
-  --loop {off,all,single}
-                        Initial loop mode (default: off)
-```
+* **Increase buffer size:** `--period-size 2048 --periods 6` (or higher)
+* **Fix sample rate (e.g., for PipeWire):** `--sample-rate 48000`
+* **Lower gain to avoid clipping:** `--gain 0.3`
+* **Disable effects (reverb/chorus) on slower machines:** `--no-effects`
+* **Disable MPRIS integration:** `--no-mpris`
 
 ---
 
@@ -188,6 +205,8 @@ This project relies on the following open-source software and components:
 * **[FluidSynth](https://www.fluidsynth.org/)**: A real-time SoundFont 2 software synthesizer. Special thanks to the FluidSynth development team and contributors for maintaining such a powerful and versatile audio engine.
 * **[pyFluidSynth](https://github.com/amberwhitehead/pyfluidsynth)**: Python bindings for FluidSynth.
 * **[mido](https://github.com/mido/mido)**: MIDI objects for Python, used for parsing MIDI messages and tracks.
+* **[pydbus](https://github.com/LEW21/pydbus)**: Pythonic D-Bus library, used to handle MPRIS D-Bus session integration.
+* **[PyGObject](https://pygobject.gnome.org/)**: Python bindings for GObject Introspection, required to enable system media controls.
 
 ---
 

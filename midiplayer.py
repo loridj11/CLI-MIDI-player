@@ -22,6 +22,14 @@ Requisiti:
     - libreria python "mido" per leggere/interpretare i file MIDI
         pip install mido
     - un SoundFont (.sf2), es. FluidR3_GM.sf2
+    - opzionale, per i controlli multimediali di sistema (MPRIS): "pydbus" e
+      PyGObject ("gi"), più un D-Bus session bus disponibile (assente in
+      molte sessioni SSH senza sessione desktop). Se mancano, il player
+      funziona comunque normalmente da tastiera, semplicemente senza i
+      controlli di sistema (si può disattivare esplicitamente con --no-mpris).
+        pip install pydbus PyGObject
+        (su Debian/Ubuntu spesso più semplice via pacchetti di sistema:
+         sudo apt install python3-pydbus python3-gi)
 
 Uso:
     python3 midiplayer.py
@@ -54,9 +62,18 @@ Comandi da tastiera:
     1-9, 0      Silenzia/riattiva il canale MIDI 1-10 (0 = canale 10,
                 di solito le percussioni) - utile come base per esercitarsi
     F1-F6       Silenzia/riattiva i canali MIDI 11-16
-    F7          Cambia SoundFont a caldo (chiede il percorso del nuovo .sf2)
+    F7          Apre un browser visivo dei SoundFont trovati nelle cartelle
+                predefinite (~/.local/share/soundfonts, /usr/share/sounds/sf2,
+                ecc.): SU/GIU per scegliere, INVIO per caricarlo subito;
+                in fondo alla lista resta l'opzione per inserire un percorso
+                manualmente, per i casi non coperti dalla ricerca
     P           Cambia lo strumento (Program Change) di un canale
                 (chiede "canale programma", es. "1 41" = canale 1, programma 41)
+    /           Apre una ricerca rapida nella playlist: filtra in tempo
+                reale i brani il cui nome contiene il testo digitato
+                (utile con librerie di centinaia di file); SU/GIU scorrono
+                solo tra i risultati, INVIO riproduce quello selezionato,
+                ESC annulla e torna alla playlist intera
     ? / H       Mostra/nasconde la legenda comandi (nascosta di default, per
                 lasciare più spazio verticale a piano roll e playlist)
     Q           Esci
@@ -69,6 +86,12 @@ MIDI, il titolo e l'autore/copyright letti dai metadati del file e, quando
 presenti, i testi (lyrics) sincronizzati come in un karaoke. Se il terminale
 supporta i colori, barra di avanzamento/stato sono verdi/ciano e l'accordo
 rilevato è in giallo per risaltare a colpo d'occhio.
+
+Se pydbus/PyGObject sono disponibili (vedi Requisiti), il player si registra
+anche come sorgente MPRIS sul D-Bus session bus: i tasti multimediali della
+tastiera e il widget audio di sistema (es. quello di GNOME/KDE) possono così
+mettere in pausa, cambiare traccia o regolare il volume anche mentre il
+terminale non è in primo piano. Disattivabile con --no-mpris.
 
 Se l'audio gracchia/distorce:
     - aumenta il buffer: --period-size 2048 --periods 6 (o valori più alti)
@@ -91,6 +114,7 @@ import shlex
 import sys
 import threading
 import time
+import traceback
 import wave
 
 try:
@@ -112,12 +136,60 @@ except ImportError:
     )
     sys.exit(1)
 
+# Integrazione MPRIS (controlli multimediali di sistema: tasti multimediali
+# della tastiera, widget audio del desktop, ecc.) - completamente OPZIONALE:
+# richiede 'pydbus' + PyGObject ('gi', il binding Python di GLib) e un D-Bus
+# session bus disponibile (assente, ad es., in molte sessioni SSH senza
+# desktop). Se manca uno qualunque di questi pezzi il player funziona
+# comunque normalmente da tastiera, semplicemente senza i controlli di
+# sistema: nessuno di questi import è quindi trattato come fatale.
+#   pip install pydbus PyGObject
+#   (su Debian/Ubuntu è spesso più semplice via pacchetti di sistema:
+#    sudo apt install python3-pydbus python3-gi)
+try:
+    import pydbus
+    from pydbus.generic import signal
+    import gi
+    gi.require_version("GLib", "2.0")
+    from gi.repository import GLib
+    MPRIS_LIBS_AVAILABLE = True
+except Exception:
+    # I pacchetti Debian python3-pydbus/python3-gi risiedono nel Python di
+    # sistema e non sono visibili a un virtualenv creato senza
+    # --system-site-packages. Prova quindi il percorso standard di Debian.
+    try:
+        system_packages = "/usr/lib/python3/dist-packages"
+        if system_packages not in sys.path and os.path.isdir(system_packages):
+            sys.path.append(system_packages)
+        import pydbus
+        from pydbus.generic import signal
+        import gi
+        gi.require_version("GLib", "2.0")
+        from gi.repository import GLib
+        MPRIS_LIBS_AVAILABLE = True
+    except Exception:
+        pydbus = None
+        signal = None
+        GLib = None
+        MPRIS_LIBS_AVAILABLE = False
+
 
 DEFAULT_SOUNDFONT_PATHS = [
     "/usr/share/sounds/sf2/FluidR3_GM.sf2",
     "/usr/share/soundfonts/FluidR3_GM.sf2",
     "/usr/share/soundfonts/default.sf2",
     "/usr/share/sounds/sf2/default-GM.sf2",
+]
+
+# Cartelle scandite dal browser visivo dei SoundFont (tasto F7): oltre alle
+# posizioni "di sistema" più comuni, anche un paio di cartelle utente tipiche
+# per chi si scarica SoundFont propri senza privilegi di amministratore.
+SOUNDFONT_SEARCH_DIRS = [
+    "/usr/share/sounds/sf2",
+    "/usr/share/soundfonts",
+    "~/.local/share/soundfonts",
+    "~/.soundfonts",
+    "~/Soundfonts",
 ]
 
 SEEK_STEP = 5.0  # secondi per un singolo "avanti"/"indietro"
@@ -171,6 +243,42 @@ def find_default_soundfont():
         if os.path.isfile(p):
             return p
     return None
+
+
+def find_soundfonts(extra_dirs=()):
+    """Cerca tutti i file .sf2/.sf3 nelle cartelle predefinite (SOUNDFONT_SEARCH_DIRS)
+    più eventuali cartelle aggiuntive (es. quella del SoundFont attualmente
+    caricato, così appare comunque in lista anche se non è tra i percorsi
+    "di sistema"). Ricerca non ricorsiva e a tolleranza di errori: cartelle
+    non leggibili o inesistenti vengono semplicemente ignorate.
+    """
+    dirs = []
+    seen_dirs = set()
+    for d in list(SOUNDFONT_SEARCH_DIRS) + list(extra_dirs):
+        d = os.path.expanduser(d) if d else d
+        if d and d not in seen_dirs:
+            seen_dirs.add(d)
+            dirs.append(d)
+
+    found = []
+    seen_files = set()
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.lower().endswith((".sf2", ".sf3")):
+                continue
+            full = os.path.join(d, entry)
+            if full not in seen_files and os.path.isfile(full):
+                seen_files.add(full)
+                found.append(full)
+
+    found.sort(key=lambda p: os.path.basename(p).lower())
+    return found
 
 
 def format_time(seconds):
@@ -1009,6 +1117,422 @@ class Playlist:
 
 LOOP_LABELS = {"off": "Off", "all": "Tutti", "single": "Singolo"}
 
+# --- MPRIS (controlli multimediali di sistema) ----------------------------------
+# Mappatura tra la nostra modalità di ripetizione e il valore standard MPRIS
+# "LoopStatus" (None/Track/Playlist), usato in entrambe le direzioni: quando
+# lo si legge da un widget di sistema (get) e quando un widget lo imposta
+# (set, es. click sull'icona di repeat nel controllo multimediale).
+MPRIS_LOOP_STATUS = {"off": "None", "all": "Playlist", "single": "Track"}
+MPRIS_LOOP_STATUS_REVERSE = {v: k for k, v in MPRIS_LOOP_STATUS.items()}
+
+MPRIS_BUS_NAME_TEMPLATE = "org.mpris.MediaPlayer2.midiplayer.instance{pid}"
+
+
+class _MPRISObject:
+    """Un solo oggetto Python che espone ENTRAMBE le interfacce MPRIS sullo
+    stesso path D-Bus ('/org/mpris/MediaPlayer2'), come richiesto dallo
+    standard: 'org.mpris.MediaPlayer2' (le proprietà "di base" comuni a ogni
+    player) e 'org.mpris.MediaPlayer2.Player' (play/pausa/successivo/
+    precedente/seek/volume, la parte che i controlli multimediali di sistema
+    usano davvero).
+
+    pydbus richiede che le interfacce condivise da un path siano tutte
+    dichiarate nell'XML 'dbus' di UN SINGOLO oggetto (un <node> con più
+    <interface> dentro): non è invece supportato passare due oggetti
+    separati per lo stesso path a bus.publish() (un tentativo in tal senso
+    veniva silenziosamente interpretato da pydbus come un errore diverso,
+    "override manuale dell'XML", causando un TypeError a runtime).
+
+    Ogni metodo/proprietà delega subito a MPRISBridge, che è l'unico punto
+    che tocca lo stato condiviso (sotto lock)."""
+
+    dbus = """
+    <node>
+      <interface name="org.mpris.MediaPlayer2">
+        <method name="Raise"/>
+        <method name="Quit"/>
+        <property name="CanQuit" type="b" access="read"/>
+        <property name="CanRaise" type="b" access="read"/>
+        <property name="HasTrackList" type="b" access="read"/>
+        <property name="Identity" type="s" access="read"/>
+        <property name="SupportedUriSchemes" type="as" access="read"/>
+        <property name="SupportedMimeTypes" type="as" access="read"/>
+      </interface>
+      <interface name="org.mpris.MediaPlayer2.Player">
+        <method name="Next"/>
+        <method name="Previous"/>
+        <method name="Pause"/>
+        <method name="PlayPause"/>
+        <method name="Stop"/>
+        <method name="Play"/>
+        <method name="Seek">
+          <arg direction="in" type="x" name="Offset"/>
+        </method>
+        <method name="SetPosition">
+          <arg direction="in" type="o" name="TrackId"/>
+          <arg direction="in" type="x" name="Position"/>
+        </method>
+        <property name="PlaybackStatus" type="s" access="read"/>
+        <property name="LoopStatus" type="s" access="readwrite"/>
+        <property name="Rate" type="d" access="readwrite"/>
+        <property name="Shuffle" type="b" access="readwrite"/>
+        <property name="Metadata" type="a{sv}" access="read"/>
+        <property name="Volume" type="d" access="readwrite"/>
+        <property name="Position" type="x" access="read"/>
+        <property name="MinimumRate" type="d" access="read"/>
+        <property name="MaximumRate" type="d" access="read"/>
+        <property name="CanGoNext" type="b" access="read"/>
+        <property name="CanGoPrevious" type="b" access="read"/>
+        <property name="CanPlay" type="b" access="read"/>
+        <property name="CanPause" type="b" access="read"/>
+        <property name="CanSeek" type="b" access="read"/>
+        <property name="CanControl" type="b" access="read"/>
+        <signal name="Seeked">
+          <arg type="x" name="Position"/>
+        </signal>
+      </interface>
+    </node>
+    """
+
+    def __init__(self, bridge):
+        self._bridge = bridge
+
+    Seeked = signal() if signal is not None else None
+
+    # ---- org.mpris.MediaPlayer2 -------------------------------------------------
+    def Raise(self):
+        pass  # player da terminale: nessuna finestra da poter portare in primo piano
+
+    def Quit(self):
+        self._bridge.request_quit()
+
+    @property
+    def CanQuit(self):
+        return True
+
+    @property
+    def CanRaise(self):
+        return False
+
+    @property
+    def HasTrackList(self):
+        return False
+
+    @property
+    def Identity(self):
+        return "MIDI Player (FluidSynth)"
+
+    @property
+    def SupportedUriSchemes(self):
+        return []
+
+    @property
+    def SupportedMimeTypes(self):
+        return []
+
+    # ---- org.mpris.MediaPlayer2.Player -------------------------------------------
+    def Next(self):
+        self._bridge.request_next()
+
+    def Previous(self):
+        self._bridge.request_prev()
+
+    def Pause(self):
+        self._bridge.request_pause()
+
+    def Play(self):
+        self._bridge.request_play()
+
+    def PlayPause(self):
+        self._bridge.request_playpause()
+
+    def Stop(self):
+        self._bridge.request_pause()  # MPRIS distingue Stop da Pause, ma per noi "fermo" è sempre "in pausa"
+
+    def Seek(self, offset_us):
+        self._bridge.request_seek(offset_us / 1_000_000.0)
+        self.Seeked(self._bridge.position_us())
+
+    def SetPosition(self, track_id, position_us):
+        self._bridge.request_set_position(position_us / 1_000_000.0)
+        self.Seeked(self._bridge.position_us())
+
+    @property
+    def PlaybackStatus(self):
+        return self._bridge.playback_status()
+
+    @property
+    def LoopStatus(self):
+        return self._bridge.loop_status()
+
+    @LoopStatus.setter
+    def LoopStatus(self, value):
+        self._bridge.set_loop_status(value)
+
+    @property
+    def Rate(self):
+        return self._bridge.rate()
+
+    @Rate.setter
+    def Rate(self, value):
+        self._bridge.set_rate(value)
+
+    @property
+    def Shuffle(self):
+        return self._bridge.shuffle()
+
+    @Shuffle.setter
+    def Shuffle(self, value):
+        self._bridge.set_shuffle(value)
+
+    @property
+    def Metadata(self):
+        return self._bridge.metadata()
+
+    @property
+    def Volume(self):
+        return self._bridge.volume()
+
+    @Volume.setter
+    def Volume(self, value):
+        self._bridge.set_volume(value)
+
+    @property
+    def Position(self):
+        return self._bridge.position_us()
+
+    @property
+    def MinimumRate(self):
+        return SPEED_MIN
+
+    @property
+    def MaximumRate(self):
+        return SPEED_MAX
+
+    @property
+    def CanGoNext(self):
+        return True
+
+    @property
+    def CanGoPrevious(self):
+        return True
+
+    @property
+    def CanPlay(self):
+        return True
+
+    @property
+    def CanPause(self):
+        return True
+
+    @property
+    def CanSeek(self):
+        return True
+
+    @property
+    def CanControl(self):
+        return True
+
+
+MPRIS_ERROR_LOG_PATH = os.path.expanduser("~/.cache/midiplayer/mpris_error.log")
+
+
+class MPRISBridge:
+    """Fa da ponte tra i controlli multimediali di sistema (MPRIS, via D-Bus)
+    e lo stato del player (FluidSynthTrack/Playlist).
+
+    Gira in un thread dedicato con un proprio GLib.MainLoop (richiesto da
+    pydbus/GLib per ricevere le chiamate D-Bus in arrivo): ogni comando che
+    arriva da lì (Play/Pause/Next/Seek/...) viene applicato allo stato
+    condiviso sotto 'lock' - la STESSA lock usata dalla UI curses per le
+    stesse operazioni (vedi run_ui), così un comando dal tastierino
+    multimediale del sistema e uno da tastiera del terminale non possano
+    corrompersi a vicenda se capitano nello stesso istante.
+
+    Se pydbus/PyGObject non sono installati, o se non è disponibile un
+    D-Bus session bus (es. sessioni SSH senza sessione desktop), l'avvio
+    fallisce in modo silenzioso (start() ritorna False): il player resta
+    perfettamente utilizzabile da tastiera, semplicemente senza i controlli
+    di sistema.
+    """
+
+    def __init__(self, track, playlist, lock, on_track_change, on_quit_request):
+        self.track = track
+        self.playlist = playlist
+        self.lock = lock
+        self._on_track_change = on_track_change  # () -> None: avvia playlist.current dopo un next/prev
+        self._on_quit_request = on_quit_request    # () -> None: richiede l'uscita dal player
+        self._bus = None
+        self._publication = None
+        self._loop = None
+        self._thread = None
+        self.active = False
+        self.last_error = None  # traceback testuale dell'ultimo tentativo fallito, per diagnosi
+
+    def start(self):
+        if not MPRIS_LIBS_AVAILABLE:
+            self.last_error = (
+                "MPRIS disabilitato: pydbus/PyGObject non sono disponibili "
+                "nell'interprete Python in uso."
+            )
+            return False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        # concede al thread D-Bus un breve margine per connettersi e
+        # pubblicare il nome sul bus, così un eventuale fallimento (es.
+        # nessun session bus disponibile) si riflette subito in 'active'
+        # invece di scoprirlo solo molto più tardi
+        self._thread.join(timeout=0.3)
+        return self.active
+
+    def _run(self):
+        try:
+            with _suppress_native_output():
+                self._bus = pydbus.SessionBus()
+                bus_name = MPRIS_BUS_NAME_TEMPLATE.format(pid=os.getpid())
+                obj = _MPRISObject(self)
+                self._publication = self._bus.publish(bus_name, ("/org/mpris/MediaPlayer2", obj))
+            self._loop = GLib.MainLoop()
+            GLib.timeout_add_seconds(1, self._emit_properties_changed)
+            self.active = True
+            self._loop.run()
+        except Exception:
+            self.active = False
+            # L'eccezione viene comunque ingoiata qui (il player deve restare
+            # utilizzabile da tastiera anche se MPRIS fallisce), ma il motivo
+            # reale del fallimento va salvato da qualche parte: prima veniva
+            # scartato del tutto, rendendo impossibile capire perché "non
+            # funziona" pur con le librerie installate correttamente.
+            self.last_error = traceback.format_exc()
+            try:
+                os.makedirs(os.path.dirname(MPRIS_ERROR_LOG_PATH), exist_ok=True)
+                with open(MPRIS_ERROR_LOG_PATH, "w") as f:
+                    f.write(self.last_error)
+            except Exception:
+                pass  # anche il logging su file è "best effort"
+
+    def _emit_properties_changed(self):
+        """Notifica periodicamente stato/posizione ai widget di sistema, così
+        restano sincronizzati anche senza emettere un segnale puntuale ad ogni
+        singola modifica (più semplice e robusto di un diffing preciso
+        proprietà-per-proprietà, al costo di una latenza fino a ~1s)."""
+        try:
+            changed = {
+                "PlaybackStatus": GLib.Variant("s", self.playback_status()),
+                "Metadata": GLib.Variant("a{sv}", self.metadata()),
+                "Position": GLib.Variant("x", self.position_us()),
+            }
+            self._bus.con.emit_signal(
+                None, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties",
+                "PropertiesChanged", GLib.Variant("(sa{sv}as)",
+                                                   ("org.mpris.MediaPlayer2.Player", changed, [])),
+            )
+        except Exception:
+            pass
+        return self.active  # ritornare False fermerebbe definitivamente il timeout
+
+    def stop(self):
+        if self._loop is not None:
+            try:
+                GLib.idle_add(self._loop.quit)
+            except Exception:
+                pass
+        if self._publication is not None:
+            try:
+                self._publication.unpublish()
+            except Exception:
+                pass
+
+    # ---- richieste in arrivo da D-Bus: applicate sotto lock --------------------
+    def request_next(self):
+        with self.lock:
+            if self.playlist.next():
+                self._on_track_change()
+
+    def request_prev(self):
+        with self.lock:
+            if self.playlist.prev():
+                self._on_track_change()
+
+    def request_pause(self):
+        with self.lock:
+            if not self.track.paused:
+                self.track.pause()
+
+    def request_play(self):
+        with self.lock:
+            if self.track.paused:
+                self.track.resume()
+
+    def request_playpause(self):
+        with self.lock:
+            self.track.toggle_pause()
+
+    def request_seek(self, delta_seconds):
+        with self.lock:
+            self.track.seek(delta_seconds)
+
+    def request_set_position(self, target_seconds):
+        with self.lock:
+            self.track.seek(target_seconds - self.track.elapsed())
+
+    def request_quit(self):
+        self._on_quit_request()
+
+    # ---- stato letto da D-Bus (proprietà) ---------------------------------------
+    def playback_status(self):
+        if self.track.finished:
+            return "Stopped"
+        return "Paused" if self.track.paused else "Playing"
+
+    def loop_status(self):
+        return MPRIS_LOOP_STATUS.get(self.playlist.loop_mode, "None")
+
+    def set_loop_status(self, value):
+        mode = MPRIS_LOOP_STATUS_REVERSE.get(value)
+        if mode:
+            with self.lock:
+                self.playlist.loop_mode = mode
+
+    def rate(self):
+        return self.track.speed
+
+    def set_rate(self, value):
+        with self.lock:
+            self.track.change_speed(value - self.track.speed)
+
+    def shuffle(self):
+        return self.playlist.shuffle
+
+    def set_shuffle(self, value):
+        with self.lock:
+            self.playlist.shuffle = bool(value)
+
+    def metadata(self):
+        path = self.playlist.current if self.playlist.files else ""
+        filename = os.path.basename(path)
+        title = filename[:-4] if filename.lower().endswith(".mid") else filename
+        length_us = int(self.track.duration * 1_000_000)
+        meta = {
+            "mpris:trackid": GLib.Variant("o", f"/org/mpris/MediaPlayer2/Track/{self.playlist.index}"),
+            "mpris:length": GLib.Variant("x", length_us),
+            "xesam:title": GLib.Variant("s", title),
+        }
+        if self.track.author:
+            meta["xesam:artist"] = GLib.Variant("as", [self.track.author])
+        return meta
+
+    def volume(self):
+        return min(1.0, self.track.gain / GAIN_MAX) if GAIN_MAX else 0.0
+
+    def set_volume(self, value):
+        with self.lock:
+            self.track.gain = max(GAIN_MIN, min(GAIN_MAX, value * GAIN_MAX))
+            self.track.synth.setting("synth.gain", self.track.gain)
+
+    def position_us(self):
+        return int(self.track.elapsed() * 1_000_000)
+
 # --- colori --------------------------------------------------------------------
 # Numeri di color pair curses (inizializzati in init_colors(), chiamata una
 # sola volta all'avvio della UI): definiti qui come costanti così il resto
@@ -1301,6 +1825,84 @@ def render_piano_roll(stdscr, cache, track, row0, col0, width, colors_enabled):
 
 
 
+def curses_select_list(stdscr, title, items, selected_value=None, help_line=None):
+    """Menu di selezione a scorrimento, a schermo intero, in stile coerente
+    con la playlist principale (nessun bordo, riga evidenziata in reverse
+    video). Usato dal browser visivo dei SoundFont (F7), ma scritto in modo
+    generico per poter servire anche ad altri elenchi in futuro.
+
+    'items' è una lista di tuple (etichetta, valore). 'selected_value', se
+    corrisponde al valore di una voce, marca quella riga con l'icona ▶ (per
+    segnalare, ad es., il SoundFont attualmente caricato) e ne parte come
+    selezione iniziale. Ritorna il valore scelto con INVIO, o None se
+    l'utente annulla con Q/ESC.
+    """
+    if not items:
+        return None
+    stdscr.nodelay(False)
+    stdscr.timeout(-1)
+    curses.curs_set(0)
+
+    sel = 0
+    for i, (_, value) in enumerate(items):
+        if selected_value is not None and value == selected_value:
+            sel = i
+            break
+    scroll = 0
+
+    try:
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            try:
+                stdscr.addstr(0, 2, title[: w - 4], curses.A_BOLD)
+            except curses.error:
+                pass
+
+            list_top = 2
+            max_rows = max(1, h - list_top - 2)
+            if sel < scroll:
+                scroll = sel
+            elif sel >= scroll + max_rows:
+                scroll = sel - max_rows + 1
+            scroll = max(0, min(scroll, max(0, len(items) - max_rows)))
+
+            for r in range(max_rows):
+                i = scroll + r
+                if i >= len(items):
+                    break
+                label, value = items[i]
+                is_current = selected_value is not None and value == selected_value
+                marker = "\u25b6 " if is_current else "  "
+                attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+                if is_current and i != sel:
+                    attr |= curses.A_BOLD
+                try:
+                    stdscr.addstr(list_top + r, 2, (marker + label)[: w - 4], attr)
+                except curses.error:
+                    pass
+
+            footer = help_line or "SU/GIU naviga | INVIO seleziona | Q/ESC annulla"
+            try:
+                stdscr.addstr(h - 1, 2, footer[: w - 4], curses.A_DIM)
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == curses.KEY_UP:
+                sel = (sel - 1) % len(items)
+            elif key == curses.KEY_DOWN:
+                sel = (sel + 1) % len(items)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                return items[sel][1]
+            elif key in (27, ord("q"), ord("Q")):
+                return None
+    finally:
+        stdscr.nodelay(True)
+        stdscr.timeout(150)
+
+
 def curses_prompt(stdscr, message):
     """Chiede una riga di testo all'utente restando dentro la sessione curses
     (usato per il percorso di un nuovo SoundFont o per un Program Change)."""
@@ -1326,7 +1928,7 @@ def curses_prompt(stdscr, message):
 
 
 def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
-           period_size, periods, sample_rate, no_effects):
+           period_size, periods, sample_rate, no_effects, enable_mpris=True):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(150)  # ms, controlla anche il refresh della UI
@@ -1341,14 +1943,48 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
     render_cache = {}
     prev_size = stdscr.getmaxyx()
     show_help = False  # la legenda comandi compare solo premendo ?/H, per lasciare più spazio verticale
+    search_mode = False   # True mentre si digita nella barra di ricerca playlist ('/')
+    search_query = ""
+    quit_event = threading.Event()  # impostato da MPRIS Quit() per chiedere l'uscita dal loop principale
+
+    # Lock condivisa tra il thread della UI (qui) e l'eventuale thread MPRIS:
+    # protegge le operazioni che manipolano il ciclo di vita del thread di
+    # riproduzione di FluidSynthTrack (start/restart/seek/trasposizione/
+    # cambio SoundFont), l'unico punto realmente a rischio di corruzione se
+    # un comando dal tastierino multimediale di sistema e uno da tastiera
+    # del terminale capitano nello stesso istante.
+    state_lock = threading.Lock()
 
     def load_index(i):
         playlist.index = i
         playlist.selected = i
         track.start(playlist.current)
 
+    mpris = MPRISBridge(track, playlist, state_lock,
+                         on_track_change=lambda: track.start(playlist.current),
+                         on_quit_request=quit_event.set)
+    mpris_active = enable_mpris and mpris.start()
+    if enable_mpris and not mpris_active:
+        # le librerie ci sono ma l'avvio è fallito comunque: molto più utile
+        # indicarlo subito che lasciar credere che sia tutto a posto
+        status_msg = "MPRIS non avviato: controlla il terminale e il log"
+
+    def move_selection(delta):
+        if not filtered_indices:
+            return
+        try:
+            pos = filtered_indices.index(playlist.selected)
+        except ValueError:
+            pos = 0
+        pos = max(0, min(len(filtered_indices) - 1, pos + delta))
+        playlist.selected = filtered_indices[pos]
+
+    filtered_indices = list(range(len(playlist.files)))  # ricalcolata ad ogni frame più sotto
+
     try:
         while True:
+            if quit_event.is_set():
+                break
             h, w = stdscr.getmaxyx()
             if (h, w) != prev_size:
                 # ridimensionamento del terminale: qui un erase() completo è
@@ -1430,29 +2066,47 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             render_piano_roll(stdscr, render_cache, track, row, 2, w - 2, colors_enabled)
             row += PIANO_ROLL_ROWS + 3  # header + righe + etichette note + una riga di spaziatura
 
-            playlist_total = len(playlist.files)
+            # Filtro di ricerca rapida ('/'): filtered_indices è la lista di
+            # indici REALI in playlist.files che corrispondono alla query
+            # (sottostringa case-insensitive sul nome file). playlist.selected
+            # continua a puntare sempre a un indice reale (non alla posizione
+            # nella lista filtrata): così ENTER/is_playing/autoplay ecc.
+            # restano corretti invariati anche quando il filtro è attivo.
+            if search_query:
+                q = search_query.lower()
+                filtered_indices = [i for i, f in enumerate(playlist.files)
+                                     if q in os.path.basename(f).lower()]
+            else:
+                filtered_indices = list(range(len(playlist.files)))
+
+            playlist_total = len(filtered_indices)
             list_start_row = row + 1
             help_rows = 3 if show_help else 1  # righe riservate in fondo (vedi sotto)
             max_list_rows = max(1, h - list_start_row - help_rows - 1)
 
             # scorrimento: la finestra visibile segue la voce selezionata,
             # tenendola centrata quando la playlist non ci sta tutta a schermo
+            sel_pos = filtered_indices.index(playlist.selected) if playlist.selected in filtered_indices else 0
             if playlist_total <= max_list_rows:
                 scroll_offset = 0
             else:
-                scroll_offset = playlist.selected - max_list_rows // 2
+                scroll_offset = sel_pos - max_list_rows // 2
                 scroll_offset = max(0, min(scroll_offset, playlist_total - max_list_rows))
 
             header = "Playlist:"
+            if search_query:
+                header += f"  [ricerca: '{search_query}']"
             if playlist_total > max_list_rows:
                 shown_first = scroll_offset + 1
                 shown_last = min(scroll_offset + max_list_rows, playlist_total)
                 header += f"  ({shown_first}-{shown_last}/{playlist_total})"
+            elif search_query:
+                header += f"  ({playlist_total} risultati)"
             draw_line(stdscr, render_cache, row, 2, header, curses.A_UNDERLINE)
             row += 1
 
-            visible_indices = range(scroll_offset, min(scroll_offset + max_list_rows, playlist_total))
-            for r, i in enumerate(visible_indices):
+            visible_slice = filtered_indices[scroll_offset: scroll_offset + max_list_rows]
+            for r, i in enumerate(visible_slice):
                 fname = os.path.basename(playlist.files[i])
                 is_playing = i == playlist.index
                 is_selected = i == playlist.selected
@@ -1464,38 +2118,55 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                     attr |= curses.A_REVERSE
                 line = f"{marker} {fname}"[: w - 4]
                 draw_line(stdscr, render_cache, list_start_row + r, 4, line, attr)
+            if not visible_slice and search_query:
+                draw_line(stdscr, render_cache, list_start_row, 4, "(nessun risultato)"[: w - 4], curses.A_DIM)
             # ripulisce eventuali righe rimaste da una playlist scorsa più lunga
-            # (es. dopo un ridimensionamento) che non vengono più riscritte qui sopra
-            for r in range(len(visible_indices), max_list_rows):
+            # (es. dopo un ridimensionamento, o un filtro appena allargato) che
+            # non vengono più riscritte qui sopra
+            for r in range(len(visible_slice), max_list_rows):
                 draw_line(stdscr, render_cache, list_start_row + r, 4, "")
 
             if show_help:
                 help1 = ("SPAZIO pausa | <-/-> 5s | N/B brano | R riavvia | SU/GIU/INVIO playlist | "
-                         "L loop | S shuffle")
+                         "L loop | S shuffle | / cerca")
                 help2 = ("+/- volume | </> velocita' | [/] trasposizione | P programma | "
                          "1-9,0/F1-F6 muta canale | F7 SoundFont")
-                help3 = "?/H nascondi comandi | Q esci"
+                mpris_note = "  | MPRIS: ON" if mpris_active else ""
+                help3 = f"?/H nascondi comandi | Q esci{mpris_note}"
                 draw_line(stdscr, render_cache, h - 4, 2, help1[: w - 4])
                 draw_line(stdscr, render_cache, h - 3, 2, help2[: w - 4])
                 draw_line(stdscr, render_cache, h - 2, 2, help3[: w - 4])
             else:
                 draw_line(stdscr, render_cache, h - 2, 2, "Premi ?/H per i comandi | Q per uscire"[: w - 4])
-            draw_line(stdscr, render_cache, h - 1, 2, status_msg[: w - 4])
+            if search_mode:
+                # mentre si digita la ricerca, la barra sostituisce
+                # temporaneamente la riga di stato (che tanto in quel momento
+                # non avrebbe nulla di più urgente da mostrare)
+                draw_line(stdscr, render_cache, h - 1, 2, f"Cerca: {search_query}_"[: w - 4], curses.A_BOLD)
+                try:
+                    stdscr.move(h - 1, min(w - 2, 2 + len("Cerca: ") + len(search_query)))
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
+            else:
+                curses.curs_set(0)
+                draw_line(stdscr, render_cache, h - 1, 2, status_msg[: w - 4])
 
             stdscr.noutrefresh()
             curses.doupdate()
 
             # avanzamento automatico a fine brano
             if track.is_song_over():
-                if playlist.loop_mode == "single":
-                    track.restart()
-                    status_msg = "Ripeti brano"
-                elif playlist.next():
-                    track.start(playlist.current)
-                    status_msg = "Brano successivo"
-                else:
-                    track.finished = True
-                    status_msg = "Fine della playlist"
+                with state_lock:
+                    if playlist.loop_mode == "single":
+                        track.restart()
+                        status_msg = "Ripeti brano"
+                    elif playlist.next():
+                        track.start(playlist.current)
+                        status_msg = "Brano successivo"
+                    else:
+                        track.finished = True
+                        status_msg = "Fine della playlist"
 
             try:
                 key = stdscr.getch()
@@ -1504,7 +2175,36 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
 
             if key == -1:
                 continue
-            elif key == curses.KEY_RESIZE:
+
+            if search_mode:
+                # Filtro di ricerca rapida della playlist: mentre si digita,
+                # SU/GIU navigano solo tra i risultati filtrati (filtered_indices,
+                # calcolata poco sopra in questo stesso frame), le altre
+                # scorciatoie del player restano sospese per evitare ambiguità
+                # con quello che si sta digitando.
+                if key == 27:  # ESC: annulla la ricerca e torna alla playlist intera
+                    search_mode = False
+                    search_query = ""
+                    playlist.selected = playlist.index
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    search_mode = False
+                    if filtered_indices:
+                        with state_lock:
+                            load_index(playlist.selected)
+                        status_msg = f"Riproduzione: {os.path.basename(playlist.current)}"
+                    else:
+                        status_msg = "Nessun risultato per la ricerca"
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    search_query = search_query[:-1]
+                elif key == curses.KEY_UP:
+                    move_selection(-1)
+                elif key == curses.KEY_DOWN:
+                    move_selection(1)
+                elif 32 <= key <= 126:
+                    search_query += chr(key)
+                continue
+
+            if key == curses.KEY_RESIZE:
                 render_cache.clear()
                 stdscr.erase()
             elif key in (ord("q"), ord("Q")):
@@ -1513,32 +2213,36 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 track.toggle_pause()
                 status_msg = "In pausa" if track.paused else "Ripresa riproduzione"
             elif key == curses.KEY_RIGHT:
-                track.seek(SEEK_STEP)
+                with state_lock:
+                    track.seek(SEEK_STEP)
                 status_msg = f"Avanti di {int(SEEK_STEP)}s"
             elif key == curses.KEY_LEFT:
-                track.seek(-SEEK_STEP)
+                with state_lock:
+                    track.seek(-SEEK_STEP)
                 status_msg = f"Indietro di {int(SEEK_STEP)}s"
             elif key in (ord("n"), ord("N")):
-                if playlist.next():
-                    track.start(playlist.current)
-                    status_msg = "Brano successivo"
-                else:
-                    status_msg = "Sei gia' all'ultimo brano"
+                with state_lock:
+                    advanced = playlist.next()
+                    if advanced:
+                        track.start(playlist.current)
+                status_msg = "Brano successivo" if advanced else "Sei gia' all'ultimo brano"
             elif key in (ord("b"), ord("B")):
-                if playlist.prev():
-                    track.start(playlist.current)
-                    status_msg = "Brano precedente"
-                else:
-                    status_msg = "Sei gia' al primo brano"
+                with state_lock:
+                    went_back = playlist.prev()
+                    if went_back:
+                        track.start(playlist.current)
+                status_msg = "Brano precedente" if went_back else "Sei gia' al primo brano"
             elif key in (ord("r"), ord("R")):
-                track.restart()
+                with state_lock:
+                    track.restart()
                 status_msg = "Brano riavviato"
             elif key == curses.KEY_UP:
-                playlist.selected = max(0, playlist.selected - 1)
+                move_selection(-1)
             elif key == curses.KEY_DOWN:
-                playlist.selected = min(len(playlist.files) - 1, playlist.selected + 1)
+                move_selection(1)
             elif key in (curses.KEY_ENTER, 10, 13):
-                load_index(playlist.selected)
+                with state_lock:
+                    load_index(playlist.selected)
                 status_msg = f"Riproduzione: {os.path.basename(playlist.current)}"
             elif key in (ord("+"), ord("="), curses.KEY_PPAGE):
                 track.change_gain(GAIN_STEP)
@@ -1553,10 +2257,12 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 track.change_speed(-SPEED_STEP)
                 status_msg = f"Velocita': {track.speed:.2f}x"
             elif key == ord("]"):
-                track.change_transpose(TRANSPOSE_STEP)
+                with state_lock:
+                    track.change_transpose(TRANSPOSE_STEP)
                 status_msg = f"Trasposizione: {track.transpose:+d} semitoni"
             elif key == ord("["):
-                track.change_transpose(-TRANSPOSE_STEP)
+                with state_lock:
+                    track.change_transpose(-TRANSPOSE_STEP)
                 status_msg = f"Trasposizione: {track.transpose:+d} semitoni"
             elif key in (ord("l"), ord("L")):
                 mode = playlist.cycle_loop_mode()
@@ -1564,6 +2270,8 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
             elif key in (ord("s"), ord("S")):
                 enabled = playlist.toggle_shuffle()
                 status_msg = "Shuffle attivato" if enabled else "Shuffle disattivato"
+            elif key == ord("/"):
+                search_mode = True
             elif key in (ord("?"), ord("h"), ord("H")):
                 show_help = not show_help
                 render_cache.clear()
@@ -1584,13 +2292,36 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 except Exception:
                     status_msg = "Formato non valido: usa 'canale programma', es. '1 41'"
             elif key == curses.KEY_F7:
-                new_sf = curses_prompt(stdscr, "Nuovo SoundFont (.sf2): ")
+                # Browser visivo dei SoundFont: cerca i .sf2/.sf3 nelle
+                # cartelle predefinite (più quella del font attualmente
+                # caricato, così è sempre in lista anche se altrove) e
+                # mostra un menu a scorrimento invece di dover digitare a
+                # mano il percorso; in coda resta comunque un'opzione per
+                # inserirlo manualmente, per i casi non coperti dalla ricerca.
+                fonts = find_soundfonts(extra_dirs=[os.path.dirname(track.soundfont_path)])
+                items = [(f"{os.path.basename(p)}  ({os.path.dirname(p)})", p) for p in fonts]
+                items.append(("\u270e Inserisci percorso manualmente...", "__manual__"))
+                title = "Scegli un SoundFont (.sf2/.sf3):"
+                if not fonts:
+                    title += "  [nessun file trovato nelle cartelle predefinite]"
+                chosen = curses_select_list(stdscr, title, items, selected_value=track.soundfont_path)
                 render_cache.clear()
                 stdscr.erase()
-                if new_sf and track.change_soundfont(new_sf):
-                    status_msg = f"SoundFont caricato: {os.path.basename(new_sf)}"
-                elif new_sf:
-                    status_msg = "Impossibile caricare il SoundFont indicato"
+                if chosen == "__manual__":
+                    new_sf = curses_prompt(stdscr, "Nuovo SoundFont (.sf2): ")
+                    render_cache.clear()
+                    stdscr.erase()
+                    with state_lock:
+                        loaded = new_sf and track.change_soundfont(new_sf)
+                    if loaded:
+                        status_msg = f"SoundFont caricato: {os.path.basename(new_sf)}"
+                    elif new_sf:
+                        status_msg = "Impossibile caricare il SoundFont indicato"
+                elif chosen:
+                    with state_lock:
+                        loaded = track.change_soundfont(chosen)
+                    status_msg = (f"SoundFont caricato: {os.path.basename(chosen)}" if loaded
+                                  else "Impossibile caricare il SoundFont selezionato")
             elif ord("0") <= key <= ord("9"):
                 # tasti 1-9 -> canali MIDI 1-9 (indici 0-8), tasto 0 -> canale 10 (indice 9)
                 digit = key - ord("0")
@@ -1606,6 +2337,7 @@ def run_ui(stdscr, soundfont, audio_driver, gain, playlist,
                 muted = channel in track.muted_channels
                 status_msg = f"Canale {channel + 1}: {'mutato' if muted else 'riattivato'}"
     finally:
+        mpris.stop()
         track.stop_process()
 
 
@@ -1684,6 +2416,9 @@ def main():
     parser.add_argument("--shuffle", action="store_true", help="Avvia la playlist in modalità casuale")
     parser.add_argument("--loop", choices=["off", "all", "single"], default="off",
                          help="Modalità di ripetizione iniziale (default: off)")
+    parser.add_argument("--no-mpris", action="store_true",
+                         help="Disattiva l'integrazione MPRIS (controlli multimediali di sistema), "
+                              "anche se pydbus/PyGObject sono installati")
     parser.add_argument("--export", metavar="OUTPUT",
                          help="Non avvia l'interfaccia: renderizza i file MIDI in WAV (rendering "
                               "offline, più veloce del tempo reale). Con un solo file, OUTPUT è il "
@@ -1769,6 +2504,7 @@ def main():
         curses.wrapper(
             run_ui, soundfont, args.audio_driver, args.gain, playlist,
             args.period_size, args.periods, args.sample_rate, args.no_effects,
+            enable_mpris=not args.no_mpris,
         )
 
     print("Riproduzione terminata.")
