@@ -1,2 +1,4 @@
 mido
 pyFluidSynth
+pydbus
+PyGObject
